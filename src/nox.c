@@ -30,7 +30,7 @@ usage(FILE *fp)
         "Usage: nox [--faketime UNIX] [--home DIR] COMMAND [OPTIONS]\n"
         "\n"
         "Commands:\n"
-        "  gen       generate a hybrid identity\n"
+        "  gen       generate an identity\n"
         "  encrypt   encrypt a message\n"
         "  decrypt   decrypt a message\n"
         "  sign      create a detached signature\n"
@@ -39,8 +39,42 @@ usage(FILE *fp)
         "  export    export a public or secret key\n"
         "  import    import a public or secret key\n"
         "  delete    delete a key from the keyring\n"
+        "  info      show version and library information\n"
+        "  help      show help (nox help COMMAND)\n"
+        "\n"
+        "Global options:\n"
+        "  --home DIR       use DIR instead of $HOME for the keyring\n"
+        "  --faketime UNIX  use UNIX time for created timestamps\n"
+        "  --version        print the version and exit\n"
+        "  --help           show this help and exit\n"
         "\n"
         "Run \"nox COMMAND --help\" for command options.\n");
+}
+
+static int
+sign_mask_for(const char *s)
+{
+    if (strcasecmp(s, "ed25519") == 0)
+        return NOX_SIGN_ED25519;
+    if (strcasecmp(s, "mldsa44") == 0 || strcasecmp(s, "mldsa") == 0)
+        return NOX_SIGN_MLDSA44;
+    if (strcasecmp(s, "hybrid") == 0 || strcasecmp(s, "both") == 0)
+        return NOX_SIGN_ED25519 | NOX_SIGN_MLDSA44;
+    nox_seterr("unknown --sign value '%s' (want ed25519, mldsa44, or hybrid)", s);
+    return -1;
+}
+
+static int
+enc_mask_for(const char *s)
+{
+    if (strcasecmp(s, "x25519") == 0)
+        return NOX_ENC_X25519;
+    if (strcasecmp(s, "mlkem768") == 0 || strcasecmp(s, "mlkem") == 0)
+        return NOX_ENC_MLKEM768;
+    if (strcasecmp(s, "hybrid") == 0 || strcasecmp(s, "both") == 0)
+        return NOX_ENC_X25519 | NOX_ENC_MLKEM768;
+    nox_seterr("unknown --enc value '%s' (want x25519, mlkem768, or hybrid)", s);
+    return -1;
 }
 
 static int
@@ -156,15 +190,19 @@ cmd_gen(int argc, char **argv)
     const char *comment = "";
     const char *pub_out = NULL, *sec_out = NULL, *passfile = NULL;
     int armor = 0;
+    int sign_mask = NOX_SIGN_ED25519 | NOX_SIGN_MLDSA44;
+    int enc_mask = NOX_ENC_X25519 | NOX_ENC_MLKEM768;
     nox_ident id;
     char pass[NOX_PASS_MAX + 1];
     uint8_t *sec = NULL, *pub = NULL;
     size_t sec_n = 0, pub_n = 0;
-    char hex[65];
+    char hex[65], suite[128];
     int c;
 
     static const struct option opts[] = {
         { "comment",         required_argument, 0, 'c' },
+        { "sign",            required_argument, 0, 's' },
+        { "enc",             required_argument, 0, 'e' },
         { "pub",             required_argument, 0, 'P' },
         { "sec",             required_argument, 0, 'S' },
         { "armor",           no_argument,       0, 'a' },
@@ -176,14 +214,28 @@ cmd_gen(int argc, char **argv)
     while ((c = getopt_long(argc, argv, "c:aF:h", opts, NULL)) != -1) {
         switch (c) {
         case 'c': comment = optarg; break;
+        case 's':
+            sign_mask = sign_mask_for(optarg);
+            if (sign_mask < 0)
+                die();
+            break;
+        case 'e':
+            enc_mask = enc_mask_for(optarg);
+            if (enc_mask < 0)
+                die();
+            break;
         case 'P': pub_out = optarg; break;
         case 'S': sec_out = optarg; break;
         case 'a': armor = 1; break;
         case 'F': passfile = optarg; break;
         case 'h':
             fprintf(stdout,
-                "Usage: nox gen [-c COMMENT] [--pub FILE] [--sec FILE] [-a]\n"
-                "               [--passphrase-file FILE]\n");
+                "Usage: nox gen [-c COMMENT] [--sign ALG] [--enc ALG]\n"
+                "               [--pub FILE] [--sec FILE] [-a]\n"
+                "               [--passphrase-file FILE]\n"
+                "\n"
+                "  --sign ALG   ed25519, mldsa44, or hybrid (default: hybrid)\n"
+                "  --enc ALG    x25519, mlkem768, or hybrid (default: hybrid)\n");
             return 0;
         default:
             return 2;
@@ -192,7 +244,8 @@ cmd_gen(int argc, char **argv)
     if (get_pass(pass, sizeof pass, 1, passfile) < 0)
         die();
     nox_ident_init(&id);
-    if (nox_ident_generate(&id, comment, nox_now()) < 0) {
+    if (nox_ident_generate_ex(&id, comment, nox_now(),
+                              (unsigned)sign_mask, (unsigned)enc_mask) < 0) {
         nox_wipe(pass, sizeof pass);
         die();
     }
@@ -220,6 +273,8 @@ cmd_gen(int argc, char **argv)
     }
     fprintf(stderr, "nox: public  %s/.nox/%s.pub\n", nox_home_dir(NULL), hex);
     fprintf(stderr, "nox: secret  %s/.nox/%s.sec\n", nox_home_dir(NULL), hex);
+    nox_ident_suite(suite, sizeof suite, &id);
+    fprintf(stderr, "nox: suite   %s\n", suite);
     if (pub_out != NULL) {
         FILE *fp;
         int op;
@@ -303,7 +358,9 @@ cmd_encrypt(int argc, char **argv)
         case 'h':
             fprintf(stdout,
                 "Usage: nox encrypt [-r FP]... [-R FILE]... [-p] [-a] [-o FILE]\n"
-                "                   [--passphrase-file FILE] [IN]\n");
+                "                   [--passphrase-file FILE] [IN]\n"
+                "\n"
+                "Encrypt for -r/-R identities, or -p for a passphrase.\n");
             return 0;
         default:
             return 2;
@@ -398,7 +455,9 @@ cmd_decrypt(int argc, char **argv)
         case 'F': passfile = optarg; break;
         case 'h':
             fprintf(stdout,
-                "Usage: nox decrypt [-i FP] [-p] [-o FILE] [--passphrase-file FILE] [IN]\n");
+                "Usage: nox decrypt [-i FP] [-p] [-o FILE] [--passphrase-file FILE] [IN]\n"
+                "\n"
+                "Decrypt with the -i identity, or -p for a passphrase.\n");
             return 0;
         default:
             return 2;
@@ -560,7 +619,9 @@ cmd_verify(int argc, char **argv)
         case 'i': ident = optarg; break;
         case 'h':
             fprintf(stdout,
-                "Usage: nox verify [-k PUBFILE | -i FP] SIG [MESSAGE]\n");
+                "Usage: nox verify [-k PUBFILE | -i FP] SIG [MESSAGE]\n"
+                "\n"
+                "Prints only \"Good signature\" on success.\n");
             return 0;
         default:
             return 2;
@@ -660,7 +721,10 @@ cmd_list(int argc, char **argv)
     optind = 1;
     while ((c = getopt_long(argc, argv, "h", NULL, NULL)) != -1) {
         if (c == 'h') {
-            fprintf(stdout, "Usage: nox list [QUERY]\n");
+            fprintf(stdout,
+                "Usage: nox list [QUERY]\n"
+                "\n"
+                "QUERY matches a fingerprint prefix or a comment substring.\n");
             return 0;
         }
         return 2;
@@ -788,6 +852,7 @@ cmd_import(int argc, char **argv)
     }
     if (type == NOX_PKT_IDENTITY) {
         nox_ident id;
+        char suite[128], esc[NOX_MAX_COMMENT_ESC];
         nox_ident_init(&id);
         if (nox_ident_parse(&id, raw, rn) < 0) {
             free(raw);
@@ -799,6 +864,9 @@ cmd_import(int argc, char **argv)
             die();
         }
         nox_hex(hex, id.fp, NOX_FP_LEN);
+        nox_ident_suite(suite, sizeof suite, &id);
+        nox_escape_comment(esc, sizeof esc, id.comment);
+        fprintf(stderr, "nox: imported public key \"%s\" (%s)\n", esc, suite);
         nox_ident_wipe(&id);
         printf("%s\n", hex);
         free(raw);
@@ -807,6 +875,7 @@ cmd_import(int argc, char **argv)
     if (type == NOX_PKT_SECRET) {
         nox_ident id;
         char pass[NOX_PASS_MAX + 1];
+        char suite[128], esc[NOX_MAX_COMMENT_ESC];
         uint8_t *pub = NULL;
         size_t pn = 0;
         nox_ident_init(&id);
@@ -833,6 +902,9 @@ cmd_import(int argc, char **argv)
             die();
         }
         nox_hex(hex, id.fp, NOX_FP_LEN);
+        nox_ident_suite(suite, sizeof suite, &id);
+        nox_escape_comment(esc, sizeof esc, id.comment);
+        fprintf(stderr, "nox: imported secret key \"%s\" (%s)\n", esc, suite);
         nox_ident_wipe(&id);
         free(pub);
         free(raw);
@@ -848,6 +920,8 @@ cmd_import(int argc, char **argv)
 static int
 cmd_delete(int argc, char **argv)
 {
+    uint8_t fp[NOX_FP_LEN];
+    char hex[65];
     int c;
 
     optind = 1;
@@ -862,9 +936,71 @@ cmd_delete(int argc, char **argv)
         nox_seterr("missing fingerprint");
         die();
     }
-    if (nox_keyring_delete(argv[optind]) < 0)
+    if (nox_keyring_delete(argv[optind], fp) < 0)
         die();
+    nox_hex(hex, fp, NOX_FP_LEN);
+    fprintf(stderr, "nox: deleted %s\n", hex);
     return 0;
+}
+
+static int
+cmd_info(int argc, char **argv)
+{
+    char kr[4096];
+    int c;
+
+    optind = 1;
+    while ((c = getopt_long(argc, argv, "h", NULL, NULL)) != -1) {
+        if (c == 'h') {
+            fprintf(stdout, "Usage: nox info\n");
+            return 0;
+        }
+        return 2;
+    }
+    if (optind < argc) {
+        nox_seterr("info takes no arguments");
+        die();
+    }
+    printf("nox %s\n", NOX_VERSION);
+    printf("author: %s\n", NOX_AUTHOR);
+    printf("spec: v%s (wire 0x%02x)\n", NOX_SPEC_VERSION, NOX_MAGIC3);
+    if (nox_keyring_dir(kr, sizeof kr) == 0)
+        printf("keyring: %s\n", kr);
+    else
+        printf("keyring: (HOME not set)\n");
+    printf("sign: ed25519 mldsa44\n");
+    printf("enc: x25519 mlkem768\n");
+    printf("kdf: argon2id (t=%u m=%u p=%u)\n",
+           NOX_ARGON2_T, NOX_ARGON2_M, NOX_ARGON2_P);
+    printf("aead: xchacha20-poly1305\n");
+    printf("hash: blake2b-256\n");
+    return 0;
+}
+
+static int
+dispatch(const char *cmd, int ac, char **av)
+{
+    if (strcmp(cmd, "gen") == 0)
+        return cmd_gen(ac, av);
+    if (strcmp(cmd, "encrypt") == 0)
+        return cmd_encrypt(ac, av);
+    if (strcmp(cmd, "decrypt") == 0)
+        return cmd_decrypt(ac, av);
+    if (strcmp(cmd, "sign") == 0)
+        return cmd_sign(ac, av);
+    if (strcmp(cmd, "verify") == 0)
+        return cmd_verify(ac, av);
+    if (strcmp(cmd, "list") == 0)
+        return cmd_list(ac, av);
+    if (strcmp(cmd, "export") == 0)
+        return cmd_export(ac, av);
+    if (strcmp(cmd, "import") == 0)
+        return cmd_import(ac, av);
+    if (strcmp(cmd, "delete") == 0)
+        return cmd_delete(ac, av);
+    if (strcmp(cmd, "info") == 0)
+        return cmd_info(ac, av);
+    return -1;
 }
 
 int
@@ -924,31 +1060,28 @@ main(int argc, char **argv)
     cmd = av[1];
     {
         int rc;
-        if (strcmp(cmd, "gen") == 0)
-            rc = cmd_gen(ac - 1, av + 1);
-        else if (strcmp(cmd, "encrypt") == 0)
-            rc = cmd_encrypt(ac - 1, av + 1);
-        else if (strcmp(cmd, "decrypt") == 0)
-            rc = cmd_decrypt(ac - 1, av + 1);
-        else if (strcmp(cmd, "sign") == 0)
-            rc = cmd_sign(ac - 1, av + 1);
-        else if (strcmp(cmd, "verify") == 0)
-            rc = cmd_verify(ac - 1, av + 1);
-        else if (strcmp(cmd, "list") == 0)
-            rc = cmd_list(ac - 1, av + 1);
-        else if (strcmp(cmd, "export") == 0)
-            rc = cmd_export(ac - 1, av + 1);
-        else if (strcmp(cmd, "import") == 0)
-            rc = cmd_import(ac - 1, av + 1);
-        else if (strcmp(cmd, "delete") == 0)
-            rc = cmd_delete(ac - 1, av + 1);
-        else if (strcmp(cmd, "help") == 0) {
-            usage(stdout);
-            rc = 0;
+        if (strcmp(cmd, "help") == 0) {
+            if (ac > 2 && strcmp(av[2], "help") != 0) {
+                char *hargv[3];
+                hargv[0] = av[1];
+                hargv[1] = "--help";
+                hargv[2] = NULL;
+                rc = dispatch(av[2], 2, hargv);
+                if (rc < 0) {
+                    fprintf(stderr, "nox: no help for '%s'\n", av[2]);
+                    rc = 2;
+                }
+            } else {
+                usage(stdout);
+                rc = 0;
+            }
         } else {
-            fprintf(stderr, "nox: unknown command '%s'\n", cmd);
-            usage(stderr);
-            rc = 2;
+            rc = dispatch(cmd, ac - 1, av + 1);
+            if (rc < 0) {
+                fprintf(stderr, "nox: unknown command '%s'\n", cmd);
+                usage(stderr);
+                rc = 2;
+            }
         }
         free(av);
         return rc;

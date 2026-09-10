@@ -11,8 +11,15 @@
 
 #define NOX_OK 0
 
+/* Global build identity. The CLI, the info command, and the manual
+ * page all report these; keep them in sync with doc/SPEC.md. */
+#define NOX_VERSION       "1.1.0"
+#define NOX_AUTHOR        "Robert Yates Stanford"
+#define NOX_SPEC_VERSION  "1.1"
+
 #define NOX_FP_LEN          32
 #define NOX_MAX_COMMENT     1024
+#define NOX_MAX_COMMENT_ESC (4 * NOX_MAX_COMMENT + 1)
 #define NOX_MAX_RECIPIENTS  16
 #define NOX_CHUNK           65536
 #define NOX_MAX_KEYS        8
@@ -64,6 +71,8 @@
 #define DS_X25519WRAP   "noxcrypt/v1/x25519-wrap"
 #define DS_MLKEMWRAP    "noxcrypt/v1/mlkem768-wrap"
 #define DS_HYBRIDWRAP   "noxcrypt/v1/hybrid-wrap"
+#define DS_X25519ONLY   "noxcrypt/v1/x25519-only-wrap"
+#define DS_MLKEMONLY    "noxcrypt/v1/mlkem768-only-wrap"
 
 extern char nox_err[256];
 
@@ -94,6 +103,13 @@ int nox_sig_len(uint16_t alg);
 int nox_usage_ok(uint16_t alg, uint8_t usage);
 int nox_is_sign_alg(uint16_t alg);
 int nox_is_enc_alg(uint16_t alg);
+const char *nox_alg_name(uint16_t alg);
+
+/* Escape a comment for one-line display: printable ASCII passes
+ * through, '\"' and '\\' are backslash-escaped, valid multibyte
+ * UTF-8 is kept, and anything else becomes \xNN. `dst` needs
+ * NOX_MAX_COMMENT_ESC bytes to hold any valid comment. */
+void nox_escape_comment(char *dst, size_t n, const char *src);
 
 int nox_argon2id(uint8_t key[32], const void *pass, size_t pass_len,
                  uint32_t t, uint32_t m, uint32_t p, const uint8_t salt[16]);

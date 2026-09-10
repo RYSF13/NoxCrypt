@@ -30,7 +30,11 @@ LIBSRC = \
 	src/sign.c \
 	src/keyring.c
 
-.PHONY: all clean test
+PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
+MANDIR  ?= $(PREFIX)/share/man/man1
+
+.PHONY: all clean test install uninstall
 
 all: nox
 
@@ -47,3 +51,11 @@ test: nox tests/test_unit
 clean:
 	rm -f nox tests/test_unit
 	rm -rf tests/tmp
+
+install: nox
+	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(MANDIR)"
+	install -m 0755 nox "$(DESTDIR)$(BINDIR)/nox"
+	install -m 0644 doc/nox.1 "$(DESTDIR)$(MANDIR)/nox.1"
+
+uninstall:
+	rm -f "$(DESTDIR)$(BINDIR)/nox" "$(DESTDIR)$(MANDIR)/nox.1"

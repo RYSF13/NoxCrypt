@@ -9,7 +9,7 @@
  * contract; cryptographic types and operations live in the matching
  * src/*.h files (identity, secret, cipher, sign, keyring, armor).
  *
- * Wire formats are defined in SPEC.md.  This is SPEC-v1 (draft).
+ * Wire formats are defined in doc/SPEC.md.  This is SPEC-v1.1 (draft).
  */
 
 #ifdef __cplusplus

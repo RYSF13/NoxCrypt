@@ -95,4 +95,68 @@ if "$NOX" --home "$TMP/home2" list | grep -q "$FP"; then
     die "delete left the key"
 fi
 
+# key suites: classic, pqc, mixed
+FP_C=$("$NOX" --home "$TMP/home" --faketime 1700000000 gen --sign ed25519 --enc x25519 -c 'classic@example.com' --passphrase-file "$PASS")
+FP_Q=$("$NOX" --home "$TMP/home" --faketime 1700000000 gen --sign mldsa44 --enc mlkem768 -c 'pq@example.com' --passphrase-file "$PASS")
+COMMENT="mix \"q\" $(printf '\t')end"
+FP_M=$("$NOX" --home "$TMP/home" --faketime 1700000000 gen --sign ed25519 --enc mlkem768 -c "$COMMENT" --passphrase-file "$PASS")
+[ ${#FP_C} -eq 64 ] || die "classic fp length"
+[ ${#FP_Q} -eq 64 ] || die "pqc fp length"
+[ ${#FP_M} -eq 64 ] || die "mixed fp length"
+
+for F in "$FP_C" "$FP_Q" "$FP_M"; do
+    P=$(printf '%s' "$F" | cut -c1-8)
+    "$NOX" --home "$TMP/home" encrypt -r "$P" -o "$TMP/s.nox" "$TMP/msg"
+    "$NOX" --home "$TMP/home" decrypt -i "$P" --passphrase-file "$PASS" -o "$TMP/s.out" "$TMP/s.nox"
+    cmp "$TMP/msg" "$TMP/s.out" || die "suite $P round-trip"
+    "$NOX" --home "$TMP/home" sign -i "$P" --passphrase-file "$PASS" -o "$TMP/s.sig" "$TMP/msg"
+    GOOD=$("$NOX" --home "$TMP/home" verify "$TMP/s.sig" "$TMP/msg")
+    [ "$GOOD" = "Good signature" ] || die "suite $P verify"
+done
+
+# cross-suite decrypt must fail
+PRE_C=$(printf '%s' "$FP_C" | cut -c1-8)
+PRE_Q=$(printf '%s' "$FP_Q" | cut -c1-8)
+"$NOX" --home "$TMP/home" encrypt -r "$PRE_C" -o "$TMP/x.nox" "$TMP/msg"
+if "$NOX" --home "$TMP/home" decrypt -i "$PRE_Q" --passphrase-file "$PASS" -o "$TMP/x.out" "$TMP/x.nox" 2>/dev/null; then
+    die "cross-suite decrypt succeeded"
+fi
+
+# verify against the wrong key must fail
+"$NOX" --home "$TMP/home" export -o "$TMP/q.pub" "$PRE_Q"
+"$NOX" --home "$TMP/home" sign -i "$PRE_C" --passphrase-file "$PASS" -o "$TMP/c.sig" "$TMP/msg"
+if "$NOX" --home "$TMP/home" verify -k "$TMP/q.pub" "$TMP/c.sig" "$TMP/msg" >/dev/null 2>&1; then
+    die "wrong-key verify succeeded"
+fi
+
+# list shows one three-line block per key
+"$NOX" --home "$TMP/home" list | grep -q "$FP_C 2023-11-14 sec" || die "list classic line"
+"$NOX" --home "$TMP/home" list | grep -q '^sign: ed25519; enc: x25519$' || die "list classic suite"
+"$NOX" --home "$TMP/home" list | grep -q '^sign: mldsa44; enc: mlkem768$' || die "list pqc suite"
+"$NOX" --home "$TMP/home" list | grep -q '^sign: ed25519; enc: mlkem768$' || die "list mixed suite"
+"$NOX" --home "$TMP/home" list | grep -q '^sign: ed25519 mldsa44; enc: x25519 mlkem768$' || die "list hybrid suite"
+"$NOX" --home "$TMP/home" list | grep -q 'mix \\"q\\" \\x09end' || die "list escapes comment"
+
+# single-suite keys survive export/import
+"$NOX" --home "$TMP/home" export -o "$TMP/c.pub" "$PRE_C"
+"$NOX" --home "$TMP/home2" import "$TMP/c.pub" | grep -q "$FP_C" || die "import classic"
+"$NOX" --home "$TMP/home2" list | grep -q "$FP_C 2023-11-14 pub" || die "imported pub has no sec"
+
+# info and help
+"$NOX" info | grep -q '^nox 1\.1\.0$' || die "info version"
+"$NOX" info | grep -q '^author: ' || die "info author"
+"$NOX" --home "$TMP/home" info | grep -q "keyring: $TMP/home/.nox" || die "info keyring"
+"$NOX" help gen | grep -q 'Usage: nox gen' || die "help gen"
+if "$NOX" help frobnicate >/dev/null 2>&1; then
+    die "help for unknown command succeeded"
+fi
+
+# bad suite values are rejected
+if "$NOX" --home "$TMP/home" gen --sign rsa --passphrase-file "$PASS" >/dev/null 2>&1; then
+    die "bad --sign accepted"
+fi
+if "$NOX" --home "$TMP/home" gen --enc des --passphrase-file "$PASS" >/dev/null 2>&1; then
+    die "bad --enc accepted"
+fi
+
 echo "test.sh: ok"

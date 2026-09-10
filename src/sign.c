@@ -52,11 +52,8 @@ nox_sign_detached(uint8_t **out, size_t *n, nox_ident *id,
         if (id->keys[i].usage & NOX_USAGE_SIGN)
             nsign++;
     }
-    if (nsign < 2)
-        return nox_seterr("identity is missing hybrid signing keys");
-    if (nox_ident_find(id, NOX_ALG_ED25519) == NULL ||
-        nox_ident_find(id, NOX_ALG_MLDSA44) == NULL)
-        return nox_seterr("identity is missing Ed25519 or ML-DSA-44");
+    if (nsign < 1)
+        return nox_seterr("identity has no signing key");
 
     created = nox_now();
     signed_msg(msg, created, id->fp, hash);
@@ -175,8 +172,8 @@ nox_verify_detached(const uint8_t *sig, size_t n, nox_ident *id,
         if (id->keys[i].usage & NOX_USAGE_SIGN)
             left++;
     }
-    if (left < 2) {
-        nox_seterr("public key is missing hybrid signing keys");
+    if (left < 1) {
+        nox_seterr("public key has no signing key");
         goto out;
     }
 

@@ -6,6 +6,8 @@
 #include <string.h>
 
 #define HYBRID_RVAL 1226
+#define X25519_RVAL 138
+#define MLKEM_RVAL  1194
 #define PASS_RVAL   107
 
 static const uint8_t zeros32[32];
@@ -80,6 +82,22 @@ hybrid_wrap_key(uint8_t out[32], const uint8_t xk[32], const uint8_t kk[32],
     ncrypt_blake2b_final(&ctx, out);
 }
 
+/* File-key wrap for a single-suite recipient: the X25519 (xk) or
+ * ML-KEM (kk) component plus the recipient fingerprint, under its
+ * own domain so a wrap key can never cross into another mode. */
+static void
+single_wrap_key(uint8_t out[32], const uint8_t comp[32], const uint8_t fp[32],
+                const char *ds, size_t ds_len)
+{
+    ncrypt_blake2b_ctx ctx;
+
+    ncrypt_blake2b_init(&ctx, 32);
+    ncrypt_blake2b_update(&ctx, (const uint8_t *)ds, ds_len);
+    ncrypt_blake2b_update(&ctx, comp, 32);
+    ncrypt_blake2b_update(&ctx, fp, 32);
+    ncrypt_blake2b_final(&ctx, out);
+}
+
 static void
 wrap_ad(uint8_t ad[46], const uint8_t nonce[24])
 {
@@ -141,6 +159,95 @@ out:
     nox_wipe(kem_seed, sizeof kem_seed);
     nox_wipe(ss, sizeof ss);
     nox_wipe(xk, sizeof xk);
+    nox_wipe(mk, sizeof mk);
+    nox_wipe(wk, sizeof wk);
+    nox_wipe(nonce, sizeof nonce);
+    nox_wipe(wrapped, sizeof wrapped);
+    return rc;
+}
+
+static int
+wrap_x25519(nox_buf *recs, const nox_ident *recip, const uint8_t file_key[32],
+            const uint8_t ad[46])
+{
+    const nox_key *kx = NULL;
+    uint8_t eph_sk[32], eph_pk[32], xk[32], wk[32];
+    uint8_t nonce[24], mac[16], wrapped[32];
+    uint8_t val[X25519_RVAL];
+    int i, rc = -1;
+
+    for (i = 0; i < recip->nkeys; i++) {
+        if (recip->keys[i].alg == NOX_ALG_X25519 &&
+            (recip->keys[i].usage & NOX_USAGE_ENCRYPT))
+            kx = &recip->keys[i];
+    }
+    if (kx == NULL)
+        return nox_seterr("recipient has no X25519 encryption key");
+
+    if (nox_random(eph_sk, 32) < 0 || nox_random(nonce, 24) < 0)
+        return -1;
+    ncrypt_x25519_public_key(eph_pk, eph_sk);
+    if (x25519_wrap_key(xk, eph_sk, kx->pk, eph_pk, kx->pk) < 0)
+        goto out;
+    single_wrap_key(wk, xk, recip->fp,
+                    DS_X25519ONLY, sizeof(DS_X25519ONLY) - 1);
+    ncrypt_aead_lock(wrapped, mac, wk, nonce, ad, 46, file_key, 32);
+
+    nox_be16(val, NOX_ALG_X25519);
+    memcpy(val + 2, recip->fp, 32);
+    memcpy(val + 34, eph_pk, 32);
+    memcpy(val + 66, nonce, 24);
+    memcpy(val + 90, mac, 16);
+    memcpy(val + 106, wrapped, 32);
+    rc = nox_buf_pkt(recs, NOX_PKT_RECIPIENT, val, X25519_RVAL);
+out:
+    nox_wipe(eph_sk, sizeof eph_sk);
+    nox_wipe(xk, sizeof xk);
+    nox_wipe(wk, sizeof wk);
+    nox_wipe(nonce, sizeof nonce);
+    nox_wipe(wrapped, sizeof wrapped);
+    return rc;
+}
+
+static int
+wrap_mlkem(nox_buf *recs, const nox_ident *recip, const uint8_t file_key[32],
+           const uint8_t ad[46])
+{
+    const nox_key *kk = NULL;
+    uint8_t kem_seed[32], kem_ct[1088], ss[32], mk[32], wk[32];
+    uint8_t nonce[24], mac[16], wrapped[32];
+    uint8_t val[MLKEM_RVAL];
+    int i, rc = -1;
+
+    for (i = 0; i < recip->nkeys; i++) {
+        if (recip->keys[i].alg == NOX_ALG_MLKEM768 &&
+            (recip->keys[i].usage & NOX_USAGE_ENCRYPT))
+            kk = &recip->keys[i];
+    }
+    if (kk == NULL)
+        return nox_seterr("recipient has no ML-KEM-768 encryption key");
+
+    if (nox_random(kem_seed, 32) < 0 || nox_random(nonce, 24) < 0)
+        return -1;
+    if (ncrypt_mlkem768_encapsulate(kem_ct, ss, kk->pk, kem_seed) != 0) {
+        nox_seterr("ML-KEM-768 encapsulation failed (malformed public key)");
+        goto out;
+    }
+    mlkem_wrap_key(mk, kem_ct, kk->pk, ss);
+    single_wrap_key(wk, mk, recip->fp,
+                    DS_MLKEMONLY, sizeof(DS_MLKEMONLY) - 1);
+    ncrypt_aead_lock(wrapped, mac, wk, nonce, ad, 46, file_key, 32);
+
+    nox_be16(val, NOX_ALG_MLKEM768);
+    memcpy(val + 2, recip->fp, 32);
+    memcpy(val + 34, kem_ct, 1088);
+    memcpy(val + 1122, nonce, 24);
+    memcpy(val + 1146, mac, 16);
+    memcpy(val + 1162, wrapped, 32);
+    rc = nox_buf_pkt(recs, NOX_PKT_RECIPIENT, val, MLKEM_RVAL);
+out:
+    nox_wipe(kem_seed, sizeof kem_seed);
+    nox_wipe(ss, sizeof ss);
     nox_wipe(mk, sizeof mk);
     nox_wipe(wk, sizeof wk);
     nox_wipe(nonce, sizeof nonce);
@@ -238,8 +345,11 @@ nox_encrypt(FILE *in, FILE *out, int armor,
     if (nrecips > NOX_MAX_RECIPIENTS)
         return nox_seterr("too many recipients (max %d)", NOX_MAX_RECIPIENTS);
     for (i = 0; i < nrecips; i++) {
-        if (!nox_ident_has_hybrid_enc(recips[i]))
-            return nox_seterr("recipient is missing X25519+ML-KEM-768 keys");
+        if (nox_ident_recip_alg(recips[i]) < 0) {
+            char hex[65];
+            nox_hex(hex, recips[i]->fp, NOX_FP_LEN);
+            return nox_seterr("recipient %.8s has no encryption keys", hex);
+        }
     }
 
     if (nox_random(file_key, 32) < 0 || nox_random(payload_nonce, 24) < 0)
@@ -255,7 +365,24 @@ nox_encrypt(FILE *in, FILE *out, int armor,
         }
     } else {
         for (i = 0; i < nrecips; i++) {
-            if (wrap_hybrid(&recs, recips[i], file_key, ad) < 0) {
+            int k;
+
+            switch (nox_ident_recip_alg(recips[i])) {
+            case NOX_ALG_HYBRID:
+                k = wrap_hybrid(&recs, recips[i], file_key, ad);
+                break;
+            case NOX_ALG_X25519:
+                k = wrap_x25519(&recs, recips[i], file_key, ad);
+                break;
+            case NOX_ALG_MLKEM768:
+                k = wrap_mlkem(&recs, recips[i], file_key, ad);
+                break;
+            default:
+                nox_seterr("internal error: unknown recipient suite");
+                k = -1;
+                break;
+            }
+            if (k < 0) {
                 nox_buf_free(&recs);
                 goto wipe_key;
             }
@@ -406,6 +533,96 @@ out:
 }
 
 static int
+unwrap_x25519(uint8_t file_key[32], const uint8_t *val, uint32_t vlen,
+              nox_ident *id, const uint8_t ad[46])
+{
+    const nox_key *kx;
+    uint8_t x_sk[32];
+    size_t xlen;
+    uint8_t xk[32], wk[32];
+    const uint8_t *fp, *eph_pk, *nonce, *mac, *wrapped;
+    int rc = -1;
+
+    if (vlen != X25519_RVAL)
+        return -1;
+    fp = val + 2;
+    eph_pk = val + 34;
+    nonce = val + 66;
+    mac = val + 90;
+    wrapped = val + 106;
+    if (nox_memeq(fp, id->fp, 32) != 0)
+        return -1;
+    kx = nox_ident_find(id, NOX_ALG_X25519);
+    if (kx == NULL || !kx->has_sk)
+        return nox_seterr("identity is missing encryption secrets");
+    if (!(kx->usage & NOX_USAGE_ENCRYPT))
+        return nox_seterr("encryption keys have the wrong usage");
+    if (nox_key_expand(kx, x_sk, &xlen) < 0)
+        return -1;
+    if (x25519_wrap_key(xk, x_sk, eph_pk, eph_pk, kx->pk) < 0)
+        goto out;
+    single_wrap_key(wk, xk, id->fp,
+                    DS_X25519ONLY, sizeof(DS_X25519ONLY) - 1);
+    if (ncrypt_aead_unlock(file_key, mac, wk, nonce, ad, 46, wrapped, 32) != 0) {
+        nox_seterr("x25519 unwrap failed to authenticate");
+        goto out;
+    }
+    rc = 0;
+out:
+    nox_wipe(x_sk, sizeof x_sk);
+    nox_wipe(xk, sizeof xk);
+    nox_wipe(wk, sizeof wk);
+    return rc;
+}
+
+static int
+unwrap_mlkem(uint8_t file_key[32], const uint8_t *val, uint32_t vlen,
+             nox_ident *id, const uint8_t ad[46])
+{
+    const nox_key *kk;
+    uint8_t k_sk[2400];
+    size_t klen;
+    uint8_t ss[32], mk[32], wk[32];
+    const uint8_t *fp, *kem_ct, *nonce, *mac, *wrapped;
+    int rc = -1;
+
+    if (vlen != MLKEM_RVAL)
+        return -1;
+    fp = val + 2;
+    kem_ct = val + 34;
+    nonce = val + 1122;
+    mac = val + 1146;
+    wrapped = val + 1162;
+    if (nox_memeq(fp, id->fp, 32) != 0)
+        return -1;
+    kk = nox_ident_find(id, NOX_ALG_MLKEM768);
+    if (kk == NULL || !kk->has_sk)
+        return nox_seterr("identity is missing encryption secrets");
+    if (!(kk->usage & NOX_USAGE_ENCRYPT))
+        return nox_seterr("encryption keys have the wrong usage");
+    if (nox_key_expand(kk, k_sk, &klen) < 0)
+        return -1;
+    if (ncrypt_mlkem768_decapsulate(ss, kem_ct, k_sk) != 0) {
+        nox_seterr("ML-KEM-768 decapsulation failed");
+        goto out;
+    }
+    mlkem_wrap_key(mk, kem_ct, kk->pk, ss);
+    single_wrap_key(wk, mk, id->fp,
+                    DS_MLKEMONLY, sizeof(DS_MLKEMONLY) - 1);
+    if (ncrypt_aead_unlock(file_key, mac, wk, nonce, ad, 46, wrapped, 32) != 0) {
+        nox_seterr("ml-kem unwrap failed to authenticate");
+        goto out;
+    }
+    rc = 0;
+out:
+    nox_wipe(k_sk, sizeof k_sk);
+    nox_wipe(ss, sizeof ss);
+    nox_wipe(mk, sizeof mk);
+    nox_wipe(wk, sizeof wk);
+    return rc;
+}
+
+static int
 unwrap_password(uint8_t file_key[32], const uint8_t *val, uint32_t vlen,
                 const char *pass, size_t pass_len, const uint8_t ad[46])
 {
@@ -447,7 +664,7 @@ nox_decrypt(FILE *in, FILE *out,
     uint8_t *hval = NULL;
     uint8_t payload_nonce[24], ad[46], file_key[32];
     nox_parser hp;
-    int got_key = 0, saw_pass = 0, saw_hybrid = 0, saw_classic = 0;
+    int got_key = 0, saw_pass = 0, saw_mismatch = 0;
     int nrec = 0, last = 0;
     ncrypt_aead_ctx ctx;
     uint8_t *ct = NULL, *pt = NULL;
@@ -510,11 +727,8 @@ nox_decrypt(FILE *in, FILE *out,
         alg = nox_rd16(v);
         if (alg == NOX_ALG_ARGON2ID)
             saw_pass = 1;
-        else if (alg == NOX_ALG_HYBRID)
-            saw_hybrid = 1;
-        else if (alg == NOX_ALG_X25519 || alg == NOX_ALG_MLKEM768)
-            saw_classic = 1;
-        else if (crit) {
+        else if (alg != NOX_ALG_HYBRID && alg != NOX_ALG_X25519 &&
+                 alg != NOX_ALG_MLKEM768 && crit) {
             free(hval);
             return nox_seterr("unknown critical recipient");
         }
@@ -526,10 +740,6 @@ nox_decrypt(FILE *in, FILE *out,
     if (saw_pass && nrec != 1) {
         free(hval);
         return nox_seterr("passphrase recipient must be the sole recipient");
-    }
-    if (saw_classic && !saw_hybrid && !saw_pass) {
-        free(hval);
-        return nox_seterr("classic X25519/ML-KEM recipient is not accepted (hybrid required)");
     }
 
     nox_parser_init(&hp, hval + 24, plen - 24);
@@ -544,12 +754,28 @@ nox_decrypt(FILE *in, FILE *out,
         if (t != NOX_PKT_RECIPIENT || vn < 2)
             continue;
         alg = nox_rd16(v);
-        if (alg == NOX_ALG_HYBRID) {
+        if (alg == NOX_ALG_HYBRID || alg == NOX_ALG_X25519 ||
+            alg == NOX_ALG_MLKEM768) {
             int i;
             for (i = 0; i < nidents; i++) {
-                if (!nox_ident_has_hybrid_enc(idents[i]))
+                int k;
+
+                /* A recipient block is only tried against an
+                 * identity of the same suite; anything else is
+                 * either for someone else or a downgrade. */
+                if (nox_ident_recip_alg(idents[i]) != (int)alg) {
+                    if (vn >= 2 + 32 &&
+                        nox_memeq(v + 2, idents[i]->fp, 32) == 0)
+                        saw_mismatch = 1;
                     continue;
-                if (unwrap_hybrid(file_key, v, vn, idents[i], ad) == 0) {
+                }
+                if (alg == NOX_ALG_HYBRID)
+                    k = unwrap_hybrid(file_key, v, vn, idents[i], ad);
+                else if (alg == NOX_ALG_X25519)
+                    k = unwrap_x25519(file_key, v, vn, idents[i], ad);
+                else
+                    k = unwrap_mlkem(file_key, v, vn, idents[i], ad);
+                if (k == 0) {
                     got_key = 1;
                     break;
                 }
@@ -563,8 +789,11 @@ nox_decrypt(FILE *in, FILE *out,
     free(hval);
     hval = NULL;
     if (!got_key) {
-        if (nox_err[0] == 0)
+        if (nox_err[0] == 0) {
+            if (saw_mismatch)
+                return nox_seterr("recipient suite does not match the identity (downgrade refused)");
             return nox_seterr("no matching recipient or wrong passphrase");
+        }
         return -1;
     }
 

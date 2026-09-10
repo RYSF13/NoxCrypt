@@ -330,6 +330,80 @@ nox_is_enc_alg(uint16_t alg)
     return alg == NOX_ALG_X25519 || alg == NOX_ALG_MLKEM768;
 }
 
+const char *
+nox_alg_name(uint16_t alg)
+{
+    switch (alg) {
+    case NOX_ALG_X25519:   return "x25519";
+    case NOX_ALG_ED25519:  return "ed25519";
+    case NOX_ALG_MLKEM768: return "mlkem768";
+    case NOX_ALG_MLDSA44:  return "mldsa44";
+    case NOX_ALG_HYBRID:   return "hybrid";
+    case NOX_ALG_ARGON2ID: return "argon2id";
+    default:               return "unknown";
+    }
+}
+
+void
+nox_escape_comment(char *dst, size_t n, const char *src)
+{
+    static const char h[] = "0123456789abcdef";
+    const uint8_t *s = (const uint8_t *)src;
+    size_t di = 0;
+
+    if (n == 0)
+        return;
+    while (*s != 0) {
+        uint8_t c = *s;
+        size_t m = 0, k;
+
+        if (c >= 0x20 && c < 0x7f && c != '"' && c != '\\') {
+            if (di + 1 >= n)
+                break;
+            dst[di++] = (char)c;
+            s++;
+            continue;
+        }
+        if (c == '"' || c == '\\') {
+            if (di + 2 >= n)
+                break;
+            dst[di++] = '\\';
+            dst[di++] = (char)c;
+            s++;
+            continue;
+        }
+        /* Keep valid multibyte UTF-8 as is; escape the rest. */
+        if ((c & 0xe0) == 0xc0 && c >= 0xc2)
+            m = 2;
+        else if ((c & 0xf0) == 0xe0)
+            m = 3;
+        else if ((c & 0xf8) == 0xf0 && c <= 0xf4)
+            m = 4;
+        if (m > 0) {
+            for (k = 1; k < m; k++) {
+                if ((s[k] & 0xc0) != 0x80)
+                    break;
+            }
+            if (k == m) {
+                if (di + m >= n)
+                    break;
+                memcpy(dst + di, s, m);
+                di += m;
+                s += m;
+                continue;
+            }
+        }
+        if (di + 4 >= n)
+            break;
+        dst[di++] = '\\';
+        dst[di++] = 'x';
+        dst[di++] = h[c >> 4];
+        dst[di++] = h[c & 0xf];
+        s++;
+    }
+    dst[di] = 0;
+}
+
 int
 nox_argon2id(uint8_t key[32], const void *pass, size_t pass_len,
              uint32_t t, uint32_t m, uint32_t p, const uint8_t salt[16])
@@ -366,7 +440,7 @@ nox_argon2id(uint8_t key[32], const void *pass, size_t pass_len,
 const char *
 noxcrypt_version(void)
 {
-    return "1.0.0-draft";
+    return NOX_VERSION;
 }
 
 const char *

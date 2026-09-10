@@ -2,6 +2,7 @@
 #include "packet.h"
 #include "armor.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -53,6 +54,70 @@ nox_ident_has_hybrid_enc(const nox_ident *id)
             have_k = 1;
     }
     return have_x && have_k;
+}
+
+int
+nox_ident_recip_alg(const nox_ident *id)
+{
+    int i, have_x = 0, have_k = 0;
+
+    for (i = 0; i < id->nkeys; i++) {
+        if (id->keys[i].alg == NOX_ALG_X25519 &&
+            (id->keys[i].usage & NOX_USAGE_ENCRYPT))
+            have_x = 1;
+        if (id->keys[i].alg == NOX_ALG_MLKEM768 &&
+            (id->keys[i].usage & NOX_USAGE_ENCRYPT))
+            have_k = 1;
+    }
+    if (have_x && have_k)
+        return NOX_ALG_HYBRID;
+    if (have_x)
+        return NOX_ALG_X25519;
+    if (have_k)
+        return NOX_ALG_MLKEM768;
+    return -1;
+}
+
+int
+nox_ident_suite(char *dst, size_t n, const nox_ident *id)
+{
+    char tmp[128];
+    size_t off = 0;
+    int i, r;
+
+    r = snprintf(tmp + off, sizeof tmp - off, "sign:");
+    if (r > 0)
+        off += (size_t)r;
+    for (i = 0; i < id->nkeys; i++) {
+        if ((id->keys[i].usage & NOX_USAGE_SIGN) == 0)
+            continue;
+        if (off >= sizeof tmp - 16)
+            break;
+        r = snprintf(tmp + off, sizeof tmp - off,
+                     " %s", nox_alg_name(id->keys[i].alg));
+        if (r > 0)
+            off += (size_t)r;
+    }
+    if (off < sizeof tmp - 16) {
+        r = snprintf(tmp + off, sizeof tmp - off, "; enc:");
+        if (r > 0)
+            off += (size_t)r;
+    }
+    for (i = 0; i < id->nkeys; i++) {
+        if ((id->keys[i].usage & NOX_USAGE_ENCRYPT) == 0)
+            continue;
+        if (off >= sizeof tmp - 16)
+            break;
+        r = snprintf(tmp + off, sizeof tmp - off,
+                     " %s", nox_alg_name(id->keys[i].alg));
+        if (r > 0)
+            off += (size_t)r;
+    }
+    tmp[sizeof tmp - 1] = 0;
+    if (n == 0)
+        return -1;
+    snprintf(dst, n, "%s", tmp);
+    return strlen(tmp) < n ? 0 : -1;
 }
 
 static int
@@ -287,6 +352,16 @@ out:
 int
 nox_ident_generate(nox_ident *id, const char *comment, uint64_t created)
 {
+    return nox_ident_generate_ex(id, comment, created,
+                                 NOX_SIGN_ED25519 | NOX_SIGN_MLDSA44,
+                                 NOX_ENC_X25519 | NOX_ENC_MLKEM768);
+}
+
+int
+nox_ident_generate_ex(nox_ident *id, const char *comment, uint64_t created,
+                      unsigned sign_mask, unsigned enc_mask)
+{
+    int want_ed, want_dsa, want_x, want_kem;
     uint8_t ed_seed[32], ed_sk[64], ed_pk[32];
     uint8_t x_sk[32], x_pk[32];
     uint8_t kem_seed[64], kem_sk[2400], kem_pk[1184];
@@ -298,7 +373,19 @@ nox_ident_generate(nox_ident *id, const char *comment, uint64_t created)
     uint8_t *msg = NULL;
     int rc = -1;
 
+    want_ed = (sign_mask & NOX_SIGN_ED25519) != 0;
+    want_dsa = (sign_mask & NOX_SIGN_MLDSA44) != 0;
+    want_x = (enc_mask & NOX_ENC_X25519) != 0;
+    want_kem = (enc_mask & NOX_ENC_MLKEM768) != 0;
+
     nox_ident_init(id);
+    if ((sign_mask & ~(unsigned)(NOX_SIGN_ED25519 | NOX_SIGN_MLDSA44)) != 0 ||
+        (enc_mask & ~(unsigned)(NOX_ENC_X25519 | NOX_ENC_MLKEM768)) != 0)
+        return nox_seterr("unknown algorithm in key suite");
+    if (!want_ed && !want_dsa)
+        return nox_seterr("key suite needs a signing algorithm");
+    if (!want_x && !want_kem)
+        return nox_seterr("key suite needs an encryption algorithm");
     if (comment == NULL)
         comment = "";
     clen = strlen(comment);
@@ -307,19 +394,26 @@ nox_ident_generate(nox_ident *id, const char *comment, uint64_t created)
     if (!nox_utf8_ok((const uint8_t *)comment, clen))
         return nox_seterr("comment is not valid UTF-8 (or contains NUL/CR/LF)");
 
-    if (nox_random(ed_seed, 32) < 0 ||
-        nox_random(x_sk, 32) < 0 ||
-        nox_random(kem_seed, 64) < 0 ||
-        nox_random(dsa_seed, 32) < 0)
+    if ((want_ed && nox_random(ed_seed, 32) < 0) ||
+        (want_x && nox_random(x_sk, 32) < 0) ||
+        (want_kem && nox_random(kem_seed, 64) < 0) ||
+        (want_dsa && nox_random(dsa_seed, 32) < 0))
         return -1;
-    memcpy(ed_keep, ed_seed, 32);
-    memcpy(kem_keep, kem_seed, 64);
-    memcpy(dsa_keep, dsa_seed, 32);
 
-    ncrypt_ed25519_key_pair(ed_sk, ed_pk, ed_seed);
-    ncrypt_x25519_public_key(x_pk, x_sk);
-    ncrypt_mlkem768_key_pair(kem_sk, kem_pk, kem_seed);
-    ncrypt_mldsa44_key_pair(dsa_sk, dsa_pk, dsa_seed);
+    if (want_ed) {
+        memcpy(ed_keep, ed_seed, 32);
+        ncrypt_ed25519_key_pair(ed_sk, ed_pk, ed_seed);
+    }
+    if (want_x)
+        ncrypt_x25519_public_key(x_pk, x_sk);
+    if (want_kem) {
+        memcpy(kem_keep, kem_seed, 64);
+        ncrypt_mlkem768_key_pair(kem_sk, kem_pk, kem_seed);
+    }
+    if (want_dsa) {
+        memcpy(dsa_keep, dsa_seed, 32);
+        ncrypt_mldsa44_key_pair(dsa_sk, dsa_pk, dsa_seed);
+    }
 
     if (nox_buf_init(&body, NOX_MAX_IDENT) < 0)
         goto wipe;
@@ -327,11 +421,15 @@ nox_ident_generate(nox_ident *id, const char *comment, uint64_t created)
     nox_buf_u16(&body, (uint16_t)clen);
     nox_buf_put(&body, comment, clen);
     keys_off = body.n;
-    put_pubkey(&body, NOX_ALG_ED25519, NOX_USAGE_SIGN | NOX_USAGE_AUTH,
-               ed_pk, 32);
-    put_pubkey(&body, NOX_ALG_MLDSA44, NOX_USAGE_SIGN, dsa_pk, 1312);
-    put_pubkey(&body, NOX_ALG_X25519, NOX_USAGE_ENCRYPT, x_pk, 32);
-    put_pubkey(&body, NOX_ALG_MLKEM768, NOX_USAGE_ENCRYPT, kem_pk, 1184);
+    if (want_ed)
+        put_pubkey(&body, NOX_ALG_ED25519, NOX_USAGE_SIGN | NOX_USAGE_AUTH,
+                   ed_pk, 32);
+    if (want_dsa)
+        put_pubkey(&body, NOX_ALG_MLDSA44, NOX_USAGE_SIGN, dsa_pk, 1312);
+    if (want_x)
+        put_pubkey(&body, NOX_ALG_X25519, NOX_USAGE_ENCRYPT, x_pk, 32);
+    if (want_kem)
+        put_pubkey(&body, NOX_ALG_MLKEM768, NOX_USAGE_ENCRYPT, kem_pk, 1184);
     if (body.err) {
         nox_buf_free(&body);
         goto wipe;
@@ -347,8 +445,10 @@ nox_ident_generate(nox_ident *id, const char *comment, uint64_t created)
     }
     memcpy(msg, DS_IDENTITY, sizeof(DS_IDENTITY) - 1);
     memcpy(msg + sizeof(DS_IDENTITY) - 1, body.p, body.n);
-    ncrypt_ed25519_sign(ed_sig, ed_sk, msg, msg_len);
-    ncrypt_mldsa44_sign(dsa_sig, dsa_sk, msg, msg_len);
+    if (want_ed)
+        ncrypt_ed25519_sign(ed_sig, ed_sk, msg, msg_len);
+    if (want_dsa)
+        ncrypt_mldsa44_sign(dsa_sig, dsa_sk, msg, msg_len);
     nox_wipe(msg, msg_len);
     free(msg);
     msg = NULL;
@@ -358,8 +458,10 @@ nox_ident_generate(nox_ident *id, const char *comment, uint64_t created)
         goto wipe;
     }
     nox_buf_put(&full, body.p, body.n);
-    put_sig(&full, NOX_ALG_ED25519, ed_sig, 64);
-    put_sig(&full, NOX_ALG_MLDSA44, dsa_sig, 2420);
+    if (want_ed)
+        put_sig(&full, NOX_ALG_ED25519, ed_sig, 64);
+    if (want_dsa)
+        put_sig(&full, NOX_ALG_MLDSA44, dsa_sig, 2420);
     nox_buf_free(&body);
     if (full.err || full.n > NOX_MAX_IDENT) {
         int too_big = !full.err && full.n > NOX_MAX_IDENT;
@@ -379,43 +481,52 @@ nox_ident_generate(nox_ident *id, const char *comment, uint64_t created)
     full.p = NULL;
     nox_buf_free(&full);
 
-    id->nkeys = 4;
+    id->nkeys = 0;
 
-    id->keys[0].alg = NOX_ALG_ED25519;
-    id->keys[0].usage = NOX_USAGE_SIGN | NOX_USAGE_AUTH;
-    id->keys[0].encoding = NOX_ENC_SEED;
-    memcpy(id->keys[0].pk, ed_pk, 32);
-    id->keys[0].pk_len = 32;
-    memcpy(id->keys[0].sk, ed_keep, 32);
-    id->keys[0].sk_len = 32;
-    id->keys[0].has_sk = 1;
-
-    id->keys[1].alg = NOX_ALG_MLDSA44;
-    id->keys[1].usage = NOX_USAGE_SIGN;
-    id->keys[1].encoding = NOX_ENC_SEED;
-    memcpy(id->keys[1].pk, dsa_pk, 1312);
-    id->keys[1].pk_len = 1312;
-    memcpy(id->keys[1].sk, dsa_keep, 32);
-    id->keys[1].sk_len = 32;
-    id->keys[1].has_sk = 1;
-
-    id->keys[2].alg = NOX_ALG_X25519;
-    id->keys[2].usage = NOX_USAGE_ENCRYPT;
-    id->keys[2].encoding = NOX_ENC_SEED;
-    memcpy(id->keys[2].pk, x_pk, 32);
-    id->keys[2].pk_len = 32;
-    memcpy(id->keys[2].sk, x_sk, 32);
-    id->keys[2].sk_len = 32;
-    id->keys[2].has_sk = 1;
-
-    id->keys[3].alg = NOX_ALG_MLKEM768;
-    id->keys[3].usage = NOX_USAGE_ENCRYPT;
-    id->keys[3].encoding = NOX_ENC_SEED;
-    memcpy(id->keys[3].pk, kem_pk, 1184);
-    id->keys[3].pk_len = 1184;
-    memcpy(id->keys[3].sk, kem_keep, 64);
-    id->keys[3].sk_len = 64;
-    id->keys[3].has_sk = 1;
+    if (want_ed) {
+        nox_key *k = &id->keys[id->nkeys++];
+        k->alg = NOX_ALG_ED25519;
+        k->usage = NOX_USAGE_SIGN | NOX_USAGE_AUTH;
+        k->encoding = NOX_ENC_SEED;
+        memcpy(k->pk, ed_pk, 32);
+        k->pk_len = 32;
+        memcpy(k->sk, ed_keep, 32);
+        k->sk_len = 32;
+        k->has_sk = 1;
+    }
+    if (want_dsa) {
+        nox_key *k = &id->keys[id->nkeys++];
+        k->alg = NOX_ALG_MLDSA44;
+        k->usage = NOX_USAGE_SIGN;
+        k->encoding = NOX_ENC_SEED;
+        memcpy(k->pk, dsa_pk, 1312);
+        k->pk_len = 1312;
+        memcpy(k->sk, dsa_keep, 32);
+        k->sk_len = 32;
+        k->has_sk = 1;
+    }
+    if (want_x) {
+        nox_key *k = &id->keys[id->nkeys++];
+        k->alg = NOX_ALG_X25519;
+        k->usage = NOX_USAGE_ENCRYPT;
+        k->encoding = NOX_ENC_SEED;
+        memcpy(k->pk, x_pk, 32);
+        k->pk_len = 32;
+        memcpy(k->sk, x_sk, 32);
+        k->sk_len = 32;
+        k->has_sk = 1;
+    }
+    if (want_kem) {
+        nox_key *k = &id->keys[id->nkeys++];
+        k->alg = NOX_ALG_MLKEM768;
+        k->usage = NOX_USAGE_ENCRYPT;
+        k->encoding = NOX_ENC_SEED;
+        memcpy(k->pk, kem_pk, 1184);
+        k->pk_len = 1184;
+        memcpy(k->sk, kem_keep, 64);
+        k->sk_len = 64;
+        k->has_sk = 1;
+    }
 
     rc = 0;
 wipe:
@@ -444,6 +555,7 @@ nox_ident_parse_value(nox_ident *id, const uint8_t *val, size_t vlen)
     size_t off;
     int state = 0; /* 0 = need PK, 1 = PKs, 2 = unknown, 3 = SIGs */
     int nsign = 0;
+    unsigned seen = 0;
     const uint8_t *keys_start = NULL;
     size_t keys_len = 0;
     size_t body_len = 0;
@@ -499,6 +611,9 @@ nox_ident_parse_value(nox_ident *id, const uint8_t *val, size_t vlen)
             }
             if (!nox_usage_ok(alg, usage) || vn != (uint32_t)(3 + pkl))
                 goto bad;
+            if (seen & (1u << alg))
+                goto bad; /* each algorithm appears at most once */
+            seen |= 1u << alg;
             if (id->nkeys >= NOX_MAX_KEYS) {
                 nox_ident_wipe(id);
                 return nox_seterr("too many keys in identity");

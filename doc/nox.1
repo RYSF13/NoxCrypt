@@ -1,0 +1,314 @@
+.TH NOX 1 "September 2026" "NoxCrypt 1.1.0" "User Commands"
+.SH NAME
+nox \- hybrid classical/post-quantum file encryption and signatures
+.SH SYNOPSIS
+.B nox
+[\fB\-\-home\fR \fIDIR\fR]
+[\fB\-\-faketime\fR \fIUNIX\fR]
+\fICOMMAND\fR [\fIOPTIONS\fR]
+.br
+.B nox --version
+.br
+.B nox help
+[\fICOMMAND\fR]
+.SH DESCRIPTION
+.B nox
+is a small command-line tool for file encryption and detached
+signatures. It is closer to
+.BR age (1)
+and
+.BR minisign (1)
+than to OpenSSL: auditable C, no network protocol, stdin/stdout, one
+job per subcommand.
+.PP
+Every identity (key pair) carries a chosen
+.IR suite :
+one or two signing keys (Ed25519, ML-DSA-44) and one or two encryption
+keys (X25519, ML-KEM-768). The default suite is hybrid, all four keys.
+Encryption wraps a random file key for each recipient identity, or for
+a passphrase; signatures are detached and cover a BLAKE2b hash of the
+message.
+.PP
+Keys live in a keyring directory, selected by fingerprint prefix
+(8 to 64 lowercase hex characters, case-insensitive). Secret keys are
+always passphrase-protected with Argon2id and are never written out
+in the clear. Binary output is refused on a terminal unless armored;
+use
+.B \-\-armor
+or redirect to a file.
+.PP
+The wire format is defined in
+.IR doc/SPEC.md
+in the source tree. This build implements SPEC-v1.1 (draft, wire
+version 0x01). It is unaudited; do not treat it as production
+cryptography.
+.SH COMMANDS
+.TP
+.BR "gen " "[\fB\-c\fR \fICOMMENT\fR] [\fB\-\-sign\fR \fIALG\fR] [\fB\-\-enc\fR \fIALG\fR] [\fB\-\-pub\fR \fIFILE\fR] [\fB\-\-sec\fR \fIFILE\fR] [\fB\-a\fR] [\fB\-\-passphrase\-file\fR \fIFILE\fR]"
+Generate an identity and store it in the keyring. Prints the
+64-character fingerprint on stdout. The secret key always prompts for
+a passphrase (asked twice).
+.RS
+.TP
+.BR "\-\-sign " "\fIed25519\fR|\fImldsa44\fR|\fIhybrid\fR"
+Signing keys to generate. Default
+.BR hybrid ,
+both algorithms.
+.TP
+.BR "\-\-enc " "\fIx25519\fR|\fImlkem768\fR|\fIhybrid\fR"
+Encryption keys to generate. Default
+.BR hybrid ,
+both algorithms.
+.TP
+.BR "\-c " "\fICOMMENT\fR, " "\-\-comment " "\fICOMMENT\fR"
+Free-form label, up to 1024 bytes of UTF-8 without NUL, CR, or LF.
+.TP
+.BR "\-\-pub " "\fIFILE\fR, " "\-\-sec " "\fIFILE\fR"
+Also write the public or secret key to
+.IR FILE .
+Output to a terminal is armored automatically.
+.RE
+.TP
+.BR "encrypt " "[\fB\-r\fR \fIFP\fR]... [\fB\-R\fR \fIFILE\fR]... [\fB\-p\fR] [\fB\-a\fR] [\fB\-o\fR \fIFILE\fR] [\fB\-\-passphrase\-file\fR \fIFILE\fR] [\fIIN\fR]"
+Encrypt
+.I IN
+(stdin if omitted or
+.BR \- )
+for up to 16 recipients. Each identity recipient gets the recipient
+block that matches its suite: hybrid, X25519-only, or ML-KEM-only.
+.RS
+.TP
+.BR "\-r " "\fIFP\fR, " "\-\-recipient " "\fIFP\fR"
+Recipient fingerprint prefix from the keyring. Repeatable.
+.TP
+.BR "\-R " "\fIFILE\fR, " "\-\-recipient\-file " "\fIFILE\fR"
+Recipient public key file (binary or armored). Repeatable.
+.TP
+.BR "\-p" ", " "\-\-passphrase"
+Passphrase recipient. It must be the sole recipient; the passphrase
+is asked twice.
+.RE
+.TP
+.BR "decrypt " "[\fB\-i\fR \fIFP\fR] [\fB\-p\fR] [\fB\-o\fR \fIFILE\fR] [\fB\-\-passphrase\-file\fR \fIFILE\fR] [\fIIN\fR]"
+Decrypt
+.IR IN .
+With
+.BR \-i ,
+unlock the matching secret key (prompting for its passphrase) and
+unwrap the first recipient block of the same suite. With
+.BR \-p ,
+unwrap a passphrase ciphertext. If
+.B \-i
+is omitted and the keyring holds exactly one secret key, it is used.
+A recipient block that names the identity but uses the wrong suite is
+refused rather than unwrapped.
+.TP
+.BR "sign " "[\fB\-i\fR \fIFP\fR] [\fB\-a\fR] [\fB\-o\fR \fIFILE\fR] [\fB\-\-passphrase\-file\fR \fIFILE\fR] [\fIIN\fR]"
+Create a detached signature over
+.IR IN .
+One signature packet is emitted per signing key of the identity. The
+.B \-i
+defaulting works as in
+.BR decrypt .
+.TP
+.BR "verify " "[\fB\-k\fR \fIPUBFILE\fR | \fB\-i\fR \fIFP\fR] \fISIG\fR [\fIMESSAGE\fR]"
+Verify the detached signature
+.I SIG
+over
+.I MESSAGE
+(stdin if omitted). Every signing key of the signer's public identity
+must verify. On success prints only
+.BR "Good signature" .
+Without
+.B \-k
+or
+.BR \-i ,
+the signer's key is looked up in the keyring by the fingerprint
+stored in the signature.
+.TP
+.BR "list " "[\fIQUERY\fR]"
+List the keyring, sorted by fingerprint, one three-line block per key:
+.RS
+.PP
+.nf
+<64-hex-fingerprint> <YYYY-MM-DD> <sec|pub>
+sign: <alg>...; enc: <alg>...
+"<comment>"
+.fi
+.PP
+The date is UTC.
+.B sec
+means the secret key is present,
+.B pub
+means public only. The optional
+.I QUERY
+matches a fingerprint prefix or a comment substring
+(case-insensitive).
+.RE
+.TP
+.BR "export " "[\fB\-s\fR] [\fB\-a\fR] [\fB\-o\fR \fIFILE\fR] \fIFINGERPRINT\fR"
+Write the public key for
+.IR FINGERPRINT
+(a prefix of at least 8 hex characters) to stdout or
+.IR FILE .
+With
+.BR \-s ,
+export the (still passphrase-protected) secret key instead.
+.TP
+.BR "import " "[\fB\-\-passphrase\-file\fR \fIFILE\fR] \fIFILE\fR"
+Import a public or secret key file (binary or armored) into the
+keyring. Imports are verified before they are stored: self-signatures
+must check, and a secret key must unlock with the given passphrase
+and match its public half. Prints the fingerprint on stdout.
+.TP
+.BR "delete " "\fIFINGERPRINT\fR"
+Remove the public and secret key files for
+.IR FINGERPRINT .
+.TP
+.B info
+Show version and library information, one
+.IR "key: value"
+pair per line: version, author, spec revision, keyring path, and the
+compiled-in signing, encryption, KDF, AEAD, and hash algorithms.
+.TP
+.BR "help " "[\fICOMMAND\fR]"
+Show global help, or the help text for one command.
+.SH KEY SUITES
+.B gen
+picks signing and encryption keys independently:
+.PP
+.nf
+--sign ed25519|mldsa44|hybrid    (default: hybrid)
+--enc  x25519|mlkem768|hybrid    (default: hybrid)
+.fi
+.PP
+.B hybrid
+means both algorithms of that kind. Common combinations are the
+default hybrid suite, classic
+.RB ( "--sign ed25519 --enc x25519" ),
+post-quantum
+.RB ( "--sign mldsa44 --enc mlkem768" ),
+and mixed pairs such as Ed25519 signing with ML-KEM-768 encryption.
+.PP
+Encryption always matches the recipient's suite: a hybrid identity is
+encrypted to with the combined X25519+ML-KEM-768 wrap, a single-suite
+identity with its own X25519 or ML-KEM-768 wrap. Signatures likewise
+carry one packet per signing key of the signer. There is no way to
+talk a hybrid identity into single-algorithm operation; a different
+suite is a different identity with a different fingerprint.
+.PP
+ML-KEM-768 is a key encapsulation mechanism, not an encryption
+scheme: in every mode it only produces a shared secret, which is
+hashed with a transcript into an XChaCha20-Poly1305 key that locks
+the random file key. See
+.IR doc/SPEC.md ,
+section 6, for the exact derivations.
+.SH EXAMPLES
+Generate the default hybrid identity:
+.PP
+.nf
+nox gen \-c 'alice@example.com'
+.fi
+.PP
+Generate a classical-only identity and a post-quantum one:
+.PP
+.nf
+nox gen \-\-sign ed25519 \-\-enc x25519 \-c classic
+nox gen \-\-sign mldsa44 \-\-enc mlkem768 \-c pq
+.fi
+.PP
+Encrypt and decrypt:
+.PP
+.nf
+nox encrypt \-r 0123abcd \-a \-o secret.asc message.txt
+nox decrypt \-i 0123abcd \-o message.txt secret.asc
+.fi
+.PP
+Passphrase-only encryption (no identities):
+.PP
+.nf
+nox encrypt \-p \-a \-o secret.asc message.txt
+nox decrypt \-p \-o message.txt secret.asc
+.fi
+.PP
+Sign and verify:
+.PP
+.nf
+nox sign \-i 0123abcd \-a \-o message.sig message.txt
+nox verify message.sig message.txt
+.fi
+.PP
+Pipes and an alternate keyring:
+.PP
+.nf
+printf 'piped' | nox encrypt \-r 0123abcd \-a | \\
+    nox decrypt \-i 0123abcd > out.txt
+nox \-\-home /tmp/demo list
+.fi
+.SH FILES
+.TP
+.I $NOX_HOME/.nox
+Keyring directory if
+.B NOX_HOME
+is set, else
+.IR ~/.nox ,
+mode 0700.
+.TP
+.I <fingerprint>.pub
+Public identity, mode 0600.
+.TP
+.I <fingerprint>.sec
+Passphrase-wrapped secret identity, mode 0600.
+.SH ENVIRONMENT
+.TP
+.B NOX_HOME
+Use
+.I $NOX_HOME/.nox
+as the keyring directory. Overridden by
+.BR \-\-home .
+.TP
+.B HOME
+Home directory used to locate the default keyring.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Runtime or cryptographic failure; the reason is printed on stderr as
+.BR "nox: ..." .
+.TP
+.B 2
+Usage error.
+.SH SECURITY
+Decryption and verification fail closed: malformed input, truncated
+packets, unknown critical packets, trailing bytes, and suite
+mismatches are errors, never warnings. A recipient block that names
+your fingerprint with the wrong suite is refused as a downgrade
+attempt.
+.PP
+Secret keys are protected by Argon2id (3 passes, 64 MiB, 1 lane) with
+a random 16-byte salt per key, and plaintext secrets are wiped after
+use. Streaming decryption writes each chunk as it authenticates, so a
+failure in a later chunk cannot un-write earlier output; pipe through
+a temporary file when all-or-nothing semantics matter.
+.PP
+Passphrases are read from /dev/tty with echo disabled, and terminal
+state is restored even when interrupted. The
+.B \-\-passphrase\-file
+option exists for scripts and tests; prefer a pipe or a file with
+mode 0600 over process arguments or the environment, which leak.
+.PP
+This software has not been audited. Prefer the default hybrid suite
+unless you have a concrete reason (size, policy, hardware) to pick a
+single algorithm, and keep those reasons, not habit, in charge.
+.SH SEE ALSO
+.BR age (1),
+.BR minisign (1)
+.PP
+.I doc/SPEC.md
+and
+.I doc/GUIDE.md
+in the source distribution.
+.SH AUTHORS
+Robert Yates Stanford.
