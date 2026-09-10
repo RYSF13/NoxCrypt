@@ -7,13 +7,14 @@ encryption and signatures. It is meant to be closer to
 auditable C, no network protocol, stdin/stdout, one job per
 subcommand.
 
-This is SPEC-v1 (draft). See [SPEC.md](SPEC.md) for the binary
+This is SPEC-v1 (draft). See [doc/SPEC.md](doc/SPEC.md) for the binary
 format. Do not treat it as audited production cryptography.
 
 ## Features
 
-- Hybrid identities: Ed25519, ML-DSA-44, X25519, ML-KEM-768
-- Encrypt / decrypt (hybrid wrap, or a passphrase)
+- Hybrid identities: Ed25519 + ML-DSA-44 + X25519 + ML-KEM-768
+- Classical (`ecc`), post-quantum (`pqc`), and mixed profiles too
+- Encrypt / decrypt (hybrid, single-algorithm, or a passphrase)
 - Detached sign / verify
 - Passphrase-protected secret keys (Argon2id + XChaCha20-Poly1305)
 - ASCII armor (PEM, 64-column wrap)
@@ -33,7 +34,8 @@ make
 
 That produces `./nox`. `make test` runs the unit tests and a CLI
 round-trip (Argon2id uses 64 MiB; the first `gen` takes a few
-seconds).
+seconds). `make install` puts the binary and the man page under
+`/usr/local`; `PREFIX` and `DESTDIR` work as usual.
 
 ```
 make test
@@ -51,6 +53,16 @@ nox verify message.sig message.txt
 nox export -a 0123abcd
 nox import alice.pub
 nox delete 0123abcd
+nox info
+```
+
+Which algorithms a key carries is decided once, at generation time:
+
+```
+nox gen -A hybrid -c 'both worlds'      # the default
+nox gen -A ecc    -c 'classical only'
+nox gen -A pqc    -c 'post-quantum only'
+nox gen --sig ed25519 --kem mlkem768    # one of each, by hand
 ```
 
 Passphrase-only encryption (no identities):
@@ -60,14 +72,14 @@ nox encrypt -p -a -o secret.nox message.txt
 nox decrypt -p -o message.txt secret.nox
 ```
 
-Global options, anywhere before the operands:
+Global options go before the command name:
 
 ```
 nox --home /tmp/demo --faketime 1700000000 gen -c alice
 ```
 
 `--faketime` replaces the system clock for `created` timestamps.
-`--home` (or `NOX_HOME`) relocates the keyring to `$HOME/.nox`.
+`--home` (or `NOX_HOME`) relocates the keyring.
 
 Every command accepts `--help`. `nox verify` prints only
 `Good signature` when the signature is genuine.
@@ -88,10 +100,10 @@ The CLI is a thin `src/nox.c` over small modules:
 | `util`      | endianness, RNG, hex, files, Argon2id     |
 | `packet`    | magic and typed length-prefixed packets   |
 | `armor`     | RFC 4648 / PEM, streaming reader/writer   |
-| `identity`  | generate and parse hybrid identities      |
+| `identity`  | generate and parse identities             |
 | `secret`    | passphrase wrap for secret keys           |
 | `passphrase`| no-echo prompt, restore terminal          |
-| `cipher`    | hybrid and passphrase encryption          |
+| `cipher`    | recipient wraps and payload encryption    |
 | `sign`      | detached signatures                       |
 | `keyring`   | `~/.nox`                                  |
 
@@ -107,13 +119,27 @@ The CLI is a thin `src/nox.c` over small modules:
 - Argon2id (t=3, m=65536 KiB, p=1)
 - ML-KEM-768, ML-DSA-44
 
-Encryption to an identity always uses a single hybrid recipient
-(`0x0005`). The tool will not emit or accept a classic X25519-only
-or ML-KEM-only wrap for those identities. A passphrase recipient, if
-present, is the only recipient. Detached signatures always carry
-both Ed25519 and ML-DSA-44; verify requires both.
+Recipients follow the key: an identity holding both X25519 and
+ML-KEM-768 gets the combined `0x0005` recipient, an X25519-only
+identity gets `0x0001`, an ML-KEM-768-only identity gets `0x0003`,
+and a decryptor only accepts the flavor its own key set implies. A
+hybrid identity is never unwrapped through a single-algorithm
+recipient. The same idea applies to signatures: a signer emits one
+signature per signing key, and the verifier requires exactly those.
+
+ML-KEM-768 is a KEM, so it never encrypts file data. Its shared secret
+is hashed with BLAKE2b into the XChaCha20-Poly1305 key that wraps the
+random file key; the hybrid recipient mixes in an ephemeral X25519
+Diffie-Hellman first.
 
 Random bytes come from `getrandom(2)`.
+
+## Documentation
+
+- [doc/manual.md](doc/manual.md) - the long form manual: profiles,
+  the keyring, threat model, troubleshooting
+- [doc/nox.1](doc/nox.1) - the man page
+- [doc/SPEC.md](doc/SPEC.md) - the wire format
 
 ## License
 

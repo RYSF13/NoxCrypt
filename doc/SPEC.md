@@ -1,7 +1,7 @@
 # NoxCrypt Format Specification
 
 Status: SPEC-v1 (draft)
-Date: 2026-09-06
+Date: 2026-09-10
 
 This document is the English specification of the NoxCrypt version 1
 wire format. A v1 generator MUST emit only the packet types and
@@ -19,11 +19,20 @@ NoxCrypt is a small Linux tool for hybrid (classical + post-quantum)
 encryption and signatures. It follows the Unix tradition of age and
 minisign: one job, pipes, auditable C, no network protocol.
 
-- New identities always carry Ed25519 (SIGN|AUTH), ML-DSA-44 (SIGN),
-  X25519 (ENCRYPT), and ML-KEM-768 (ENCRYPT).
-- Encryption to an identity is hybrid. The generator emits exactly one
-  recipient algorithm, `0x0005`, per identity. It never silently
-  downgrades to X25519-only (`0x0001`) or ML-KEM-only (`0x0003`).
+- An identity carries at least one signing algorithm (Ed25519,
+  ML-DSA-44) and at least one encryption algorithm (X25519,
+  ML-KEM-768). The generator offers three profiles: hybrid (all four),
+  ecc (Ed25519 + X25519), and pqc (ML-DSA-44 + ML-KEM-768), plus an
+  explicit mixed pair.
+- Which algorithms an identity holds decides how it is addressed. The
+  generator emits exactly one recipient algorithm per identity:
+  `0x0005` when it holds both X25519 and ML-KEM-768, `0x0001` when it
+  holds only X25519, and `0x0003` when it holds only ML-KEM-768. A
+  decryptor only tries the flavor its own key set implies, so a hybrid
+  identity is never unwrapped through a single-algorithm recipient.
+- Nothing encrypts bytes with ML-KEM-768 directly. The KEM shared
+  secret (and, for hybrid recipients, an ephemeral X25519 DH) is hashed
+  into a key that wraps the file key under XChaCha20-Poly1305.
 - A passphrase recipient (`0x0006`) is exclusive: if present, it is
   the only recipient.
 - Secret keys are always wrapped with Argon2id. Unprotected private
@@ -79,16 +88,21 @@ A v1 generator MUST NOT set bit 15 and MUST NOT emit unknown types.
 
 | Id       | Name        | Role                                      |
 |----------|-------------|-------------------------------------------|
-| `0x0001` | X25519      | encryption public key (not a v1 recipient)|
+| `0x0001` | X25519      | encryption key, X25519 file-key wrap      |
 | `0x0002` | Ed25519     | signatures / authentication               |
-| `0x0003` | ML-KEM-768  | encryption public key (not a v1 recipient)|
+| `0x0003` | ML-KEM-768  | encryption key, ML-KEM file-key wrap      |
 | `0x0004` | ML-DSA-44   | signatures                                |
 | `0x0005` | Hybrid      | X25519 + ML-KEM-768 file-key wrap         |
 | `0x0006` | Argon2id    | passphrase file-key wrap                  |
 
-v1 MUST NOT emit recipient algorithms `0x0001` or `0x0003`. A v1
-decryptor that sees only those algorithms MUST refuse the file
-(anti-downgrade). Hybrid identities are decrypted only via `0x0005`.
+All three key wrap algorithms (`0x0001`, `0x0003`, `0x0005`) are
+current; which one appears is decided by the recipient identity, never
+by a preference of the sender. `0x0001` and `0x0003` are for identities
+that carry a single encryption algorithm. An identity holding both
+X25519 and ML-KEM-768 MUST be wrapped with `0x0005`, and a decryptor
+holding both MUST NOT unwrap `0x0001` or `0x0003` (anti-downgrade).
+A message MAY mix recipients of different algorithms, up to the
+recipient limit.
 
 ### 2.4 Usage bits (Public Key / Secret Key)
 
@@ -184,14 +198,23 @@ Each SIGN key signs, in order:
 where `body` is everything in `Identity.value` before the first
 Signature packet.
 
-A v1 generator writes four Public Key packets in this order:
+Public Key packets come in a fixed order, signing keys first, with the
+algorithms an identity does not use left out:
 
 1. Ed25519, usage `0x06`
 2. ML-DSA-44, usage `0x02`
 3. X25519, usage `0x01`
 4. ML-KEM-768, usage `0x01`
 
-and two Signature packets (Ed25519, then ML-DSA-44).
+The order is part of the fingerprint, so it is not a matter of taste.
+The generator writes one Signature packet per signing key, in the same
+order. An identity with no signing key is rejected; an identity with no
+encryption key parses, but nothing can be encrypted to it.
+
+The four combinations the CLI can generate are named after their key
+sets: `hybrid` (all four), `ecc` (Ed25519 + X25519), `pqc` (ML-DSA-44 +
+ML-KEM-768), and `mixed` (one signing plus one encryption algorithm
+chosen by hand).
 
 ### 4.1 Fingerprint
 
@@ -274,7 +297,10 @@ Recipient packets
 
 At most 16 recipients. If any recipient uses algorithm `0x0006`, it
 MUST be the only recipient. Unknown non-critical packets in the
-header are ignored; a critical unknown packet is fatal.
+header are ignored; a critical unknown packet is fatal. Recipients of
+different algorithms may sit in the same header: a sender that encrypts
+to a hybrid, an ecc, and a pqc identity writes one recipient of each
+kind.
 
 The 32-byte file key is random. Every recipient wraps that same file
 key. Wrapping AEAD additional data is:
@@ -283,7 +309,9 @@ key. Wrapping AEAD additional data is:
 "noxcrypt/v1/header" || magic || payload_nonce
 ```
 
-### 6.1 Hybrid recipient (`0x0005`) — required for identities
+### 6.1 Hybrid recipient (`0x0005`)
+
+Used for identities that hold both X25519 and ML-KEM-768.
 
 `Recipient.value`:
 
@@ -311,10 +339,65 @@ Derivation (sender):
 
 The recipient performs the DH with `(recipient_sk, eph_pk)` and
 ML-KEM decapsulation, then the same hashes. A hybrid identity MUST
-NOT be decrypted via a classic `0x0001` or `0x0003` recipient even
-if those keys would otherwise unwrap the file key.
+NOT be decrypted via an `0x0001` or `0x0003` recipient even if those
+keys would otherwise unwrap the file key.
 
-### 6.2 Passphrase recipient (`0x0006`)
+### 6.2 X25519 recipient (`0x0001`)
+
+Used for ecc and mixed identities that hold no ML-KEM-768 key.
+
+`Recipient.value`:
+
+```
+alg          u16     0x0001
+fingerprint  32      recipient identity fingerprint
+eph_pk       32      ephemeral X25519 public key
+nonce        24
+mac          16
+wrapped      32      AEAD ciphertext of the file key
+```
+
+Derivation (sender):
+
+1. Generate ephemeral X25519 secret `eph_sk` and public `eph_pk`.
+2. `raw = X25519(eph_sk, recipient_x25519_pk)`. If `raw` is all
+   zeros, abort.
+3. `wk = BLAKE2b-256("noxcrypt/v1/x25519-wrap" || eph_pk || recipient_x25519_pk || raw)`
+4. AEAD-lock the file key under `wk` with the header additional data
+   from section 6.
+
+The recipient repeats step 2 with `(recipient_x25519_sk, eph_pk)` and
+then step 3. Both sides hash the same three inputs in the same order:
+the ephemeral public key, the recipient's static X25519 public key,
+and the raw shared secret.
+
+### 6.3 ML-KEM-768 recipient (`0x0003`)
+
+Used for pqc and mixed identities that hold no X25519 key.
+
+`Recipient.value`:
+
+```
+alg          u16     0x0003
+fingerprint  32      recipient identity fingerprint
+kem_ct       1088    ML-KEM-768 ciphertext
+nonce        24
+mac          16
+wrapped      32      AEAD ciphertext of the file key
+```
+
+Derivation (sender):
+
+1. Encapsulate to the recipient ML-KEM-768 public key, obtaining
+   `kem_ct` and shared secret `ss`.
+2. `wk = BLAKE2b-256("noxcrypt/v1/mlkem768-wrap" || kem_ct || recipient_mlkem_pk || ss)`
+3. AEAD-lock the file key under `wk` with the header additional data
+   from section 6.
+
+The recipient decapsulates `kem_ct` and repeats step 2. The AEAD is
+still XChaCha20-Poly1305; ML-KEM only contributes key material.
+
+### 6.4 Passphrase recipient (`0x0006`)
 
 `Recipient.value`:
 
@@ -329,10 +412,12 @@ mac        16
 wrapped    32
 ```
 
-Argon2id(passphrase) → 32-byte key → AEAD-lock the file key with the
-header additional data above.
+Argon2id(passphrase) -> 32-byte key -> AEAD-lock the file key with the
+header additional data above. KDF parameters travel in the recipient
+itself, so the recipient can read a file written with other parameters
+than its own.
 
-### 6.3 Payload chunks
+### 6.5 Payload chunks
 
 The payload is XChaCha20-Poly1305 in streaming mode (`aead_init_x`
 with the file key and `payload_nonce`). Each step ratchets the key,
@@ -380,10 +465,13 @@ required to fit in memory). Each SIGN key signs:
 "noxcrypt/v1/signature" || created || fingerprint || H
 ```
 
-A v1 signer on a hybrid identity ALWAYS emits both Ed25519 and
-ML-DSA-44. A verifier MUST require every SIGN key of the offered
-public identity to verify. A signature that omits ML-DSA-44 is
-rejected (anti-downgrade). On success the CLI prints only:
+A signer emits one Signature packet per SIGN key of its identity, in
+identity order, and nothing else: one for an ecc or pqc identity, two
+for a hybrid one. A verifier MUST require every SIGN key of the
+offered public identity to verify, no more and no fewer; a signature
+that drops ML-DSA-44 from a hybrid identity, or that carries an
+algorithm the identity does not have, is rejected. On success the CLI
+prints only:
 
 ```
 Good signature
@@ -430,9 +518,13 @@ is two files, mode `0600`:
 <64-hex-fingerprint>.sec
 ```
 
-`nox list` walks the whole keyring and prints aligned columns
-(fingerprint, UTC creation time, comment). An optional query matches
-a fingerprint prefix or a substring of the comment.
+`nox list` walks the whole keyring and prints one block per identity:
+fingerprint and UTC creation date on the first line, the profile and
+its algorithms on the second, the comment in double quotes on the
+third. Keys whose secret half is missing say so on the second line.
+Blocks are sorted by fingerprint, because directory order is not.
+An optional query matches a fingerprint prefix or a substring of the
+comment.
 
 ## 10. CLI
 
@@ -444,7 +536,7 @@ nox [--faketime UNIX] [--home DIR] COMMAND [OPTIONS]
 
 | Command    | Purpose                                                |
 |------------|--------------------------------------------------------|
-| `gen`      | generate a hybrid identity, always passphrase-wrapped  |
+| `gen`      | generate an identity, always passphrase-wrapped        |
 | `encrypt`  | `-r` fingerprint, `-R` public file, or `-p` passphrase |
 | `decrypt`  | `-i` identity, or `-p` for a passphrase ciphertext     |
 | `sign`     | detached signature                                     |
@@ -453,9 +545,17 @@ nox [--faketime UNIX] [--home DIR] COMMAND [OPTIONS]
 | `export`   | `-s` for secret; prefix of at least 8 hex chars        |
 | `import`   | public or secret; secret requires the passphrase       |
 | `delete`   | remove pub and sec for a fingerprint                   |
+| `info`     | version, author, algorithms, keyring summary           |
 
-`--faketime` replaces `time()` for `created` timestamps. Stdin and
-stdout are used when a path is omitted or is `-`.
+`gen` picks algorithms with `-A hybrid|ecc|pqc` and, alternatively,
+`--sig ALG --kem ALG` for a pair chosen by hand. Using neither is the
+same as `-A hybrid`. There is no separate flag for encryption and
+signing keys at use time: `encrypt`, `sign`, and `verify` read the
+identity and use whatever it holds.
+
+Global options come before the command: `nox --home DIR list`, not
+`nox list --home DIR`. `--faketime` replaces `time()` for `created`
+timestamps. Stdin and stdout are used when a path is omitted or is `-`.
 
 Passphrases are read from `/dev/tty` with echo off. Terminal
 attributes are restored on success, error, and the usual terminating
@@ -465,7 +565,8 @@ scripts and tests). Empty passphrases are rejected.
 ## 11. Cryptographic primitives
 
 Provided by vendored libncrypt (Monocypher 4.0.3 plus the bundled
-ML-KEM-768 / ML-DSA-44 cores):
+ML-KEM-768 / ML-DSA-44 cores). Every algorithm this tool can use is
+listed here; the specification has no optional ones:
 
 - XChaCha20-Poly1305 (`ncrypt_aead_*`)
 - X25519, Ed25519 (SHA-512 EdDSA, not EdDSA-BLAKE2b)
@@ -485,24 +586,29 @@ They are never converted into each other.
 
 ## 12. Limits
 
-| Limit                     | Value        |
-|---------------------------|--------------|
-| Identity.value            | 65536 bytes  |
-| Comment                   | 1024 bytes   |
-| Keys per identity         | 8            |
-| Recipients per message    | 16           |
-| Chunk plaintext           | 65536 bytes  |
-| Passphrase                | 1023 bytes   |
-| Argon2id m (KiB)          | 8·p .. 2^21  |
+| Limit                        | Value        |
+|------------------------------|--------------|
+| Identity.value               | 65536 bytes  |
+| Comment                      | 1024 bytes   |
+| Keys per identity            | 8            |
+| Signing keys (generator)     | 2            |
+| Encryption keys (generator)  | 2            |
+| Recipients per message       | 16           |
+| Chunk plaintext              | 65536 bytes  |
+| Passphrase                   | 1023 bytes   |
+| Argon2id m (KiB)             | 8*p .. 2^21  |
 
 ## 13. Security notes
 
 - Parsers fail closed. There is no "best effort" recovery of bad
   packets, no type 0, and no critical-bit surprises from a v1
   generator.
-- Hybrid encryption and hybrid signatures both require the
-  post-quantum half. Stripping ML-KEM or ML-DSA does not yield a
-  usable classical document.
+- Hybrid documents require the post-quantum half. Stripping ML-KEM
+  from a hybrid recipient, or ML-DSA-44 from a hybrid signature, does
+  not yield a usable document.
+- An ecc identity protects nothing against a quantum computer. It is
+  what the name says: classical. The same holds for an Ed25519-only
+  signature. Choose it knowing that, not by accident.
 - Streaming encryption writes plaintext chunks as they authenticate.
   A failure in a later chunk cannot un-write earlier ones; callers
   that need all-or-nothing semantics should use a temporary file.
