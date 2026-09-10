@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* "noxcrypt/v1/signature" || created || fingerprint || message hash */
+#define SIG_MSG_LEN ((sizeof(DS_SIGNATURE) - 1) + 8 + 32 + 32)
+
 int
 nox_hash_file(FILE *fp, uint8_t hash[32])
 {
@@ -28,7 +31,7 @@ nox_hash_file(FILE *fp, uint8_t hash[32])
 }
 
 static void
-signed_msg(uint8_t msg[18 + 8 + 32 + 32], uint64_t created,
+signed_msg(uint8_t msg[SIG_MSG_LEN], uint64_t created,
            const uint8_t fp[32], const uint8_t hash[32])
 {
     memcpy(msg, DS_SIGNATURE, sizeof(DS_SIGNATURE) - 1);
@@ -41,7 +44,7 @@ int
 nox_sign_detached(uint8_t **out, size_t *n, nox_ident *id,
                   const uint8_t hash[32])
 {
-    uint8_t msg[sizeof(DS_SIGNATURE) - 1 + 8 + 32 + 32];
+    uint8_t msg[SIG_MSG_LEN];
     nox_buf inner, file;
     uint64_t created;
     int i, nsign = 0, rc = -1;
@@ -52,11 +55,8 @@ nox_sign_detached(uint8_t **out, size_t *n, nox_ident *id,
         if (id->keys[i].usage & NOX_USAGE_SIGN)
             nsign++;
     }
-    if (nsign < 2)
-        return nox_seterr("identity is missing hybrid signing keys");
-    if (nox_ident_find(id, NOX_ALG_ED25519) == NULL ||
-        nox_ident_find(id, NOX_ALG_MLDSA44) == NULL)
-        return nox_seterr("identity is missing Ed25519 or ML-DSA-44");
+    if (nsign < 1)
+        return nox_seterr("identity has no signing key");
 
     created = nox_now();
     signed_msg(msg, created, id->fp, hash);
@@ -141,7 +141,7 @@ nox_verify_detached(const uint8_t *sig, size_t n, nox_ident *id,
     uint32_t vlen;
     uint64_t created;
     const uint8_t *fp;
-    uint8_t msg[sizeof(DS_SIGNATURE) - 1 + 8 + 32 + 32];
+    uint8_t msg[SIG_MSG_LEN];
 
     if (nox_unwrap_blob(&raw, &rn, sig, n) < 0)
         return -1;
@@ -175,8 +175,8 @@ nox_verify_detached(const uint8_t *sig, size_t n, nox_ident *id,
         if (id->keys[i].usage & NOX_USAGE_SIGN)
             left++;
     }
-    if (left < 2) {
-        nox_seterr("public key is missing hybrid signing keys");
+    if (left < 1) {
+        nox_seterr("public key has no signing key");
         goto out;
     }
 

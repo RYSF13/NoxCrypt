@@ -11,6 +11,15 @@
 
 #define NOX_OK 0
 
+/*
+ * Program identity.  These are macros rather than variables so that
+ * any translation unit can use them without pulling in util.c, and so
+ * that the strings end up in .rodata and not in a writable page.
+ */
+#define NOX_VERSION "1.1.0"
+#define NOX_AUTHOR  "Robert Yates Stanford"
+#define NOX_LICENSE "MIT"
+
 #define NOX_FP_LEN          32
 #define NOX_MAX_COMMENT     1024
 #define NOX_MAX_RECIPIENTS  16
@@ -94,6 +103,19 @@ int nox_sig_len(uint16_t alg);
 int nox_usage_ok(uint16_t alg, uint8_t usage);
 int nox_is_sign_alg(uint16_t alg);
 int nox_is_enc_alg(uint16_t alg);
+
+/* "Ed25519", "ML-KEM-768", ... or "unknown" for an id we do not know. */
+const char *nox_alg_name(uint16_t alg);
+
+/*
+ * Parse a CLI algorithm name: "ed25519", "mldsa44", "x25519", "mlkem768".
+ * Dashes and case are ignored, so "ML-KEM-768" works too.  Returns 0 or
+ * -1; the conventional 0x0000 means "no match".
+ */
+int nox_alg_parse(const char *name, uint16_t *alg);
+
+/* UTC date, "YYYY-MM-DD".  Falls back to "-" out of range. */
+void nox_fmt_date(char *out, size_t n, uint64_t ts);
 
 int nox_argon2id(uint8_t key[32], const void *pass, size_t pass_len,
                  uint32_t t, uint32_t m, uint32_t p, const uint8_t salt[16]);

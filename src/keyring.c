@@ -10,7 +10,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <time.h>
 #include <unistd.h>
 
 int
@@ -37,8 +36,9 @@ nox_keyring_init(void)
     return nox_ensure_dir(dir, 0700);
 }
 
-static int
-key_path(char *buf, size_t n, const uint8_t fp[NOX_FP_LEN], const char *ext)
+int
+nox_keyring_key_path(char *buf, size_t n, const uint8_t fp[NOX_FP_LEN],
+                     const char *ext)
 {
     char dir[4096], hex[65];
     int k;
@@ -62,7 +62,7 @@ nox_keyring_store_pub(const nox_ident *id)
 
     if (nox_keyring_init() < 0)
         return -1;
-    if (key_path(path, sizeof path, id->fp, "pub") < 0)
+    if (nox_keyring_key_path(path, sizeof path, id->fp, "pub") < 0)
         return -1;
     if (nox_ident_public_blob(id, &blob, &n) < 0)
         return -1;
@@ -79,9 +79,31 @@ nox_keyring_store_sec(const uint8_t fp[NOX_FP_LEN],
 
     if (nox_keyring_init() < 0)
         return -1;
-    if (key_path(path, sizeof path, fp, "sec") < 0)
+    if (nox_keyring_key_path(path, sizeof path, fp, "sec") < 0)
         return -1;
     return nox_replace_file(path, blob, n, 0600);
+}
+
+static int
+hex64(const char *s)
+{
+    int i;
+
+    for (i = 0; i < 64; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F')))
+            return 0;
+    }
+    return 1;
+}
+
+/* A keyring file name is <64 hex chars>.<pub|sec>, nothing else. */
+static int
+key_file(const char *name, const char *ext)
+{
+    return strlen(name) == 68 && name[64] == '.' &&
+           hex64(name) && strcmp(name + 65, ext) == 0;
 }
 
 typedef struct {
@@ -96,12 +118,11 @@ scan_ext(const char *query, const char *ext, kr_match *m)
     char dir[4096], want[65];
     DIR *dp;
     struct dirent *de;
-    size_t elen, qlen;
+    size_t qlen;
 
     memset(m, 0, sizeof *m);
     if (nox_keyring_dir(dir, sizeof dir) < 0)
         return -1;
-    elen = strlen(ext);
     qlen = query ? strlen(query) : 0;
     if (qlen > 0) {
         size_t i;
@@ -111,11 +132,12 @@ scan_ext(const char *query, const char *ext, kr_match *m)
             int c = (unsigned char)query[i];
             if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
                   (c >= 'A' && c <= 'F')))
-                return nox_seterr("fingerprint query must be hex");
+                return nox_seterr("'%s' is not a fingerprint prefix "
+                                  "(hex only)", query);
             want[i] = (char)((c >= 'A' && c <= 'F') ? c + 'a' - 'A' : c);
         }
         want[qlen] = 0;
-        if (qlen < 8 && qlen != 0)
+        if (qlen < 8)
             return nox_seterr("fingerprint prefix must be at least 8 hex characters");
     }
 
@@ -126,14 +148,11 @@ scan_ext(const char *query, const char *ext, kr_match *m)
         return nox_seterr("open %s: %s", dir, strerror(errno));
     }
     while ((de = readdir(dp)) != NULL) {
-        size_t n = strlen(de->d_name);
         char hex[65];
         uint8_t fp[NOX_FP_LEN];
         size_t fpn = NOX_FP_LEN;
 
-        if (n != 64 + 1 + elen)
-            continue;
-        if (de->d_name[64] != '.' || strcmp(de->d_name + 65, ext) != 0)
+        if (!key_file(de->d_name, ext))
             continue;
         memcpy(hex, de->d_name, 64);
         hex[64] = 0;
@@ -230,19 +249,62 @@ nox_keyring_count_sec(void)
 }
 
 static int
-fmt_time(char *buf, size_t n, uint64_t ts)
+count_ext(const char *dir, const char *ext)
 {
-    time_t t = (time_t)ts;
-    struct tm tm;
+    DIR *dp;
+    struct dirent *de;
+    int n = 0;
 
-    if (gmtime_r(&t, &tm) == NULL) {
-        snprintf(buf, n, "-");
-        return 0;
+    dp = opendir(dir);
+    if (dp == NULL)
+        return errno == ENOENT ? 0 : -1;
+    while ((de = readdir(dp)) != NULL) {
+        if (key_file(de->d_name, ext))
+            n++;
     }
-    snprintf(buf, n, "%04d-%02d-%02d %02d:%02d:%02d",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec);
+    closedir(dp);
+    return n;
+}
+
+int
+nox_keyring_stats(nox_keyring_info *st)
+{
+    char dir[4096];
+
+    if (nox_keyring_dir(dir, sizeof dir) < 0)
+        return -1;
+    st->pub = count_ext(dir, "pub");
+    st->sec = count_ext(dir, "sec");
+    if (st->pub < 0 || st->sec < 0)
+        return nox_seterr("open %s: %s", dir, strerror(errno));
     return 0;
+}
+
+static int
+have_sec(const uint8_t fp[NOX_FP_LEN])
+{
+    char path[4096];
+    struct stat st;
+
+    if (nox_keyring_key_path(path, sizeof path, fp, "sec") < 0)
+        return 0;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+struct kr_row {
+    char hex[65];
+    char date[16];
+    char algs[160];
+    char comment[NOX_MAX_COMMENT + 1];
+    const char *profile;
+    int has_sec;
+};
+
+static int
+row_cmp(const void *a, const void *b)
+{
+    return strcmp(((const struct kr_row *)a)->hex,
+                  ((const struct kr_row *)b)->hex);
 }
 
 int
@@ -251,40 +313,42 @@ nox_keyring_list(FILE *out, const char *query)
     char dir[4096];
     DIR *dp;
     struct dirent *de;
-    int any = 0;
+    struct kr_row *rows = NULL;
+    size_t nrows = 0, cap = 0;
     size_t qlen = query ? strlen(query) : 0;
+    int i;
 
     if (nox_keyring_dir(dir, sizeof dir) < 0)
         return -1;
     dp = opendir(dir);
     if (dp == NULL) {
-        if (errno == ENOENT)
+        if (errno == ENOENT) {
+            if (qlen > 0)
+                fprintf(stderr, "nox: no key matches '%s'\n", query);
+            else
+                fprintf(stderr, "nox: no keys in %s\n", dir);
             return 0;
+        }
         return nox_seterr("open %s: %s", dir, strerror(errno));
     }
-    fprintf(out, "%-64s  %-19s  %s\n", "Fingerprint", "Created (UTC)", "Comment");
     while ((de = readdir(dp)) != NULL) {
-        size_t n = strlen(de->d_name);
-        char path[8192], hex[65], created[64];
+        char path[8192], hex[65];
         uint8_t *buf = NULL;
         size_t bn = 0;
         nox_ident id;
         int match;
 
-        if (n != 64 + 4)
-            continue;
-        if (strcmp(de->d_name + 64, ".pub") != 0)
+        if (!key_file(de->d_name, "pub"))
             continue;
         memcpy(hex, de->d_name, 64);
         hex[64] = 0;
-        match = 1;
+        match = 0;
         if (qlen > 0) {
-            size_t i;
-            match = 0;
+            size_t k;
             if (qlen <= 64) {
                 match = 1;
-                for (i = 0; i < qlen; i++) {
-                    int a = query[i], b = hex[i];
+                for (k = 0; k < qlen; k++) {
+                    int a = query[k], b = hex[k];
                     if (a >= 'A' && a <= 'F')
                         a += 'a' - 'A';
                     if (a != b) {
@@ -297,6 +361,7 @@ nox_keyring_list(FILE *out, const char *query)
         snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
         if (nox_read_file(path, &buf, &bn, NOX_MAX_BLOB) < 0) {
             closedir(dp);
+            free(rows);
             return -1;
         }
         nox_ident_init(&id);
@@ -312,12 +377,51 @@ nox_keyring_list(FILE *out, const char *query)
                 continue;
             }
         }
-        fmt_time(created, sizeof created, id.created);
-        fprintf(out, "%-64s  %-19s  %s\n", hex, created, id.comment);
+        if (nrows == cap) {
+            struct kr_row *p;
+            size_t ncap = cap ? cap * 2 : 16;
+            p = realloc(rows, ncap * sizeof *rows);
+            if (p == NULL) {
+                nox_ident_wipe(&id);
+                closedir(dp);
+                free(rows);
+                return nox_seterr("out of memory");
+            }
+            rows = p;
+            cap = ncap;
+        }
+        {
+            struct kr_row *r = &rows[nrows++];
+
+            memcpy(r->hex, hex, 65);
+            nox_fmt_date(r->date, sizeof r->date, id.created);
+            r->profile = nox_ident_profile(&id);
+            nox_ident_alg_list(&id, r->algs, sizeof r->algs);
+            strcpy(r->comment, id.comment);
+            r->has_sec = have_sec(id.fp);
+        }
         nox_ident_wipe(&id);
-        any = 1;
     }
     closedir(dp);
-    (void)any;
+
+    /* readdir order is arbitrary; sort by fingerprint */
+    if (nrows > 1)
+        qsort(rows, nrows, sizeof *rows, row_cmp);
+
+    for (i = 0; i < (int)nrows; i++) {
+        if (i > 0)
+            fputc('\n', out);
+        fprintf(out, "%s  %s\n", rows[i].hex, rows[i].date);
+        fprintf(out, "  %s: %s%s\n", rows[i].profile, rows[i].algs,
+                rows[i].has_sec ? "" : " (no secret key)");
+        fprintf(out, "  \"%s\"\n", rows[i].comment);
+    }
+    free(rows);
+    if (nrows == 0) {
+        if (qlen > 0)
+            fprintf(stderr, "nox: no key matches '%s'\n", query);
+        else
+            fprintf(stderr, "nox: no keys in %s\n", dir);
+    }
     return 0;
 }
