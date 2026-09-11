@@ -3,6 +3,11 @@ CFLAGS  ?= -O2 -Wall -Wextra -std=c11
 CPPFLAGS += -Iinclude -Isrc -Ivendor/libncrypt
 LDFLAGS ?=
 
+PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
+MANDIR  ?= $(PREFIX)/share/man/man1
+DESTDIR ?=
+
 SRC = \
 	src/util.c \
 	src/packet.c \
@@ -30,7 +35,7 @@ LIBSRC = \
 	src/sign.c \
 	src/keyring.c
 
-.PHONY: all clean test
+.PHONY: all clean test install uninstall
 
 all: nox
 
@@ -43,6 +48,14 @@ tests/test_unit: tests/test_unit.c $(LIBSRC) $(VENDOR)
 test: nox tests/test_unit
 	./tests/test_unit
 	./tests/test.sh
+
+install: nox
+	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(MANDIR)
+	install -m 0755 nox $(DESTDIR)$(BINDIR)/nox
+	install -m 0644 doc/nox.1 $(DESTDIR)$(MANDIR)/nox.1
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/nox $(DESTDIR)$(MANDIR)/nox.1
 
 clean:
 	rm -f nox tests/test_unit

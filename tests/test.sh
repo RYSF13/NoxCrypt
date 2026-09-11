@@ -95,4 +95,87 @@ if "$NOX" --home "$TMP/home2" list | grep -q "$FP"; then
     die "delete left the key"
 fi
 
+# ---- algorithm profiles ------------------------------------------------
+
+# One keyring per profile, each with a full signing and encryption
+# round-trip.  Prints the fingerprint of the key it made.
+run_profile() {
+    name=$1
+    opts=$2
+    want=$3
+    home="$TMP/$name"
+
+    mkdir -p "$home"
+    fp=$("$NOX" --home "$home" --faketime 1700000100 gen $opts \
+         -c "$name key" --passphrase-file "$PASS") || die "$name: gen"
+    [ ${#fp} -eq 64 ] || die "$name: fingerprint length"
+    pre=$(printf '%s' "$fp" | cut -c1-8)
+
+    "$NOX" --home "$home" list | grep -q "^$fp" || die "$name: list fingerprint"
+    "$NOX" --home "$home" list | grep -q "$want" || die "$name: list profile"
+    "$NOX" --home "$home" list | grep -q "^  \"$name key\"$" || die "$name: list comment"
+    "$NOX" --home "$home" list | grep -q "$(date -u -d @1700000100 +%Y-%m-%d)" ||
+        die "$name: list date"
+
+    "$NOX" --home "$home" encrypt -r "$pre" -o "$TMP/$name.nox" "$TMP/big"
+    "$NOX" --home "$home" decrypt -i "$pre" --passphrase-file "$PASS" \
+        -o "$TMP/$name.out" "$TMP/$name.nox"
+    cmp "$TMP/big" "$TMP/$name.out" || die "$name: encrypt/decrypt mismatch"
+
+    "$NOX" --home "$home" sign -i "$pre" --passphrase-file "$PASS" \
+        -o "$TMP/$name.sig" "$TMP/msg"
+    [ "$("$NOX" --home "$home" verify "$TMP/$name.sig" "$TMP/msg")" = "Good signature" ] ||
+        die "$name: verify"
+
+    "$NOX" --home "$home" export -a -o "$TMP/$name.pub" "$pre"
+    "$NOX" --home "$TMP/$name-ro" import "$TMP/$name.pub" > /dev/null
+    "$NOX" --home "$TMP/$name-ro" list | grep -q '(no secret key)' ||
+        die "$name: public-only key not marked"
+    "$NOX" --home "$TMP/$name-ro" list | grep -q "$want" ||
+        die "$name: profile lost on import"
+
+    echo "$fp"
+}
+
+FP_ECC=$(run_profile ecc "-A ecc" "ecc: Ed25519 + X25519")
+FP_PQC=$(run_profile pqc "-A pqc" "pqc: ML-DSA-44 + ML-KEM-768")
+FP_MIX=$(run_profile mixed "--sig ed25519 --kem mlkem768" "mixed: Ed25519 + ML-KEM-768")
+
+# A key only reads the recipient flavor that matches its own algorithms.
+if "$NOX" --home "$TMP/ecc" decrypt -i "$FP_ECC" --passphrase-file "$PASS" \
+        -o "$TMP/cross" "$TMP/msg.nox" 2>/dev/null; then
+    die "ecc key decrypted a hybrid message"
+fi
+if "$NOX" --home "$TMP/home" decrypt -i "$PRE" --passphrase-file "$PASS" \
+        -o "$TMP/cross" "$TMP/ecc.nox" 2>/dev/null; then
+    die "hybrid key decrypted an ecc message"
+fi
+if "$NOX" --home "$TMP/pqc" decrypt -i "$FP_PQC" --passphrase-file "$PASS" \
+        -o "$TMP/cross" "$TMP/mixed.nox" 2>/dev/null; then
+    die "pqc key decrypted a mixed message"
+fi
+
+# Bad selections are refused before anything is written.
+if "$NOX" --home "$TMP/home" gen -A bogus --passphrase-file "$PASS" >/dev/null 2>&1; then
+    die "gen accepted an unknown profile"
+fi
+if "$NOX" --home "$TMP/home" gen --sig ed25519 --passphrase-file "$PASS" >/dev/null 2>&1; then
+    die "gen accepted --sig without --kem"
+fi
+if "$NOX" --home "$TMP/home" gen --sig x25519 --kem mlkem768 \
+        --passphrase-file "$PASS" >/dev/null 2>&1; then
+    die "gen accepted an encryption algorithm as --sig"
+fi
+
+# ---- info and version --------------------------------------------------
+
+"$NOX" --home "$TMP/home" info | grep -q "^nox " || die "info version"
+"$NOX" --home "$TMP/home" info | grep -q "Robert Yates Stanford" || die "info author"
+"$NOX" --home "$TMP/home" info | grep -q "1 public key, 1 secret key" ||
+    die "info keyring counts"
+"$NOX" --version | grep -q "^nox " || die "--version"
+"$NOX" gen --help | grep -q "^Usage: nox gen" || die "gen --help"
+"$NOX" info --help | grep -q "^Usage: nox info" || die "info --help"
+"$NOX" list --help | grep -q "^Usage: nox list" || die "list --help"
+
 echo "test.sh: ok"

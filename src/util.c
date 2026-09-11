@@ -330,6 +330,84 @@ nox_is_enc_alg(uint16_t alg)
     return alg == NOX_ALG_X25519 || alg == NOX_ALG_MLKEM768;
 }
 
+static const struct {
+    uint16_t alg;
+    const char *name;
+} alg_names[] = {
+    { NOX_ALG_X25519,   "X25519" },
+    { NOX_ALG_ED25519,  "Ed25519" },
+    { NOX_ALG_MLKEM768, "ML-KEM-768" },
+    { NOX_ALG_MLDSA44,  "ML-DSA-44" },
+    { NOX_ALG_HYBRID,   "X25519+ML-KEM-768" },
+    { NOX_ALG_ARGON2ID, "Argon2id" },
+};
+
+const char *
+nox_alg_name(uint16_t alg)
+{
+    size_t i;
+
+    for (i = 0; i < sizeof alg_names / sizeof alg_names[0]; i++) {
+        if (alg_names[i].alg == alg)
+            return alg_names[i].name;
+    }
+    return "unknown";
+}
+
+int
+nox_alg_parse(const char *name, uint16_t *alg)
+{
+    static const struct {
+        const char *text;
+        uint16_t alg;
+    } table[] = {
+        { "ed25519",  NOX_ALG_ED25519 },
+        { "mldsa44",  NOX_ALG_MLDSA44 },
+        { "mldsa",    NOX_ALG_MLDSA44 },
+        { "x25519",   NOX_ALG_X25519 },
+        { "mlkem768", NOX_ALG_MLKEM768 },
+        { "mlkem",    NOX_ALG_MLKEM768 },
+    };
+    char clean[24];
+    size_t i, n = 0;
+
+    if (name == NULL)
+        return -1;
+    for (i = 0; name[i] != 0; i++) {
+        char c = name[i];
+        if (c == '-' || c == '_' || c == ' ')
+            continue;
+        if (n + 1 >= sizeof clean)
+            return -1;
+        if (c >= 'A' && c <= 'Z')
+            c = (char)(c + 'a' - 'A');
+        clean[n++] = c;
+    }
+    clean[n] = 0;
+    for (i = 0; i < sizeof table / sizeof table[0]; i++) {
+        if (strcmp(clean, table[i].text) == 0) {
+            *alg = table[i].alg;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+void
+nox_fmt_date(char *out, size_t n, uint64_t ts)
+{
+    time_t t = (time_t)ts;
+    struct tm tm;
+
+    if (gmtime_r(&t, &tm) == NULL) {
+        if (n > 0)
+            snprintf(out, n, "-");
+        return;
+    }
+    snprintf(out, n, "%04d-%02d-%02d", tm.tm_year + 1900, tm.tm_mon + 1,
+             tm.tm_mday);
+}
+
 int
 nox_argon2id(uint8_t key[32], const void *pass, size_t pass_len,
              uint32_t t, uint32_t m, uint32_t p, const uint8_t salt[16])
@@ -366,7 +444,7 @@ nox_argon2id(uint8_t key[32], const void *pass, size_t pass_len,
 const char *
 noxcrypt_version(void)
 {
-    return "1.0.0-draft";
+    return NOX_VERSION;
 }
 
 const char *
@@ -501,15 +579,37 @@ nox_read_file(const char *path, uint8_t **out, size_t *n, size_t max)
 int
 nox_ensure_dir(const char *path, mode_t mode)
 {
+    char tmp[4096];
     struct stat st;
+    size_t i, n;
 
     if (stat(path, &st) == 0) {
         if (!S_ISDIR(st.st_mode))
             return nox_seterr("%s exists and is not a directory", path);
         return 0;
     }
-    if (mkdir(path, mode) < 0)
-        return nox_seterr("mkdir %s: %s", path, strerror(errno));
+    n = strlen(path);
+    if (n == 0 || n >= sizeof tmp)
+        return nox_seterr("path too long");
+
+    /* --home /tmp/fresh has to work, so fill in the missing parents */
+    memcpy(tmp, path, n + 1);
+    for (i = 1; i < n; i++) {
+        if (tmp[i] != '/')
+            continue;
+        tmp[i] = 0;
+        if (mkdir(tmp, mode) < 0 && errno != EEXIST) {
+            nox_seterr("mkdir %s: %s", tmp, strerror(errno));
+            return -1;
+        }
+        tmp[i] = '/';
+    }
+    if (mkdir(tmp, mode) < 0) {
+        if (errno != EEXIST)
+            return nox_seterr("mkdir %s: %s", path, strerror(errno));
+        if (stat(tmp, &st) < 0 || !S_ISDIR(st.st_mode))
+            return nox_seterr("%s exists and is not a directory", path);
+    }
     return 0;
 }
 
